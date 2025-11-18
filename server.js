@@ -35,6 +35,7 @@ const corsOptions = {
   origin: [
     'http://localhost:5173',
     'http://localhost:3000',
+    'http://localhost:8080',  // Added for your current dev setup
     'https://talk-profit-link.vercel.app', // Add your production frontend URL
     process.env.FRONTEND_URL,
     process.env.ALLOWED_ORIGIN
