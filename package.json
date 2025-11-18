@@ -1,0 +1,26 @@
+{
+  "name": "talk-profit-payment-server",
+  "version": "1.0.0",
+  "description": "Stripe Payment Intent server for TalkProfit credit top-ups",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["stripe", "payments", "nodejs", "express"],
+  "author": "TalkProfit",
+  "license": "MIT",
+  "dependencies": {
+    "stripe": "^14.25.0",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
