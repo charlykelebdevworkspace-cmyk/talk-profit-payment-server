@@ -6,6 +6,9 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const dotenv = require('dotenv');
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -133,6 +136,176 @@ app.post('/create-payment-intent', paymentLimiter, async (req, res) => {
   }
 });
 
+// Create Stripe Connect Express account
+app.post('/stripe/create-express-account', paymentLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    console.log(`🔄 Creating Stripe Express account for email: ${email}`);
+
+    // Create Stripe Express account
+    const account = await stripe.accounts.create({
+      type: 'express',
+      email: email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_type: 'individual',
+    });
+
+    console.log(`✅ Stripe Express account created: ${account.id}`);
+
+    res.json({
+      accountId: account.id,
+      message: 'Express account created successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error creating Express account:', error);
+    res.status(500).json({ 
+      error: 'Failed to create Express account',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Create account onboarding link
+app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
+  try {
+    const { accountId, returnUrl, refreshUrl } = req.body;
+
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ error: 'Valid account ID required' });
+    }
+
+    console.log(`🔄 Creating account link for: ${accountId}`);
+
+    // Create account link for onboarding
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: refreshUrl || `${process.env.FRONTEND_URL}/settings?stripe_refresh=true`,
+      return_url: returnUrl || `${process.env.FRONTEND_URL}/settings?stripe_return=true`,
+      type: 'account_onboarding',
+    });
+
+    console.log(`✅ Account link created for: ${accountId}`);
+
+    res.json({
+      onboardingUrl: accountLink.url,
+      message: 'Account link created successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error creating account link:', error);
+    res.status(500).json({ 
+      error: 'Failed to create account link',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Get account status
+app.post('/stripe/account-status', async (req, res) => {
+  try {
+    const { accountId } = req.body;
+
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ error: 'Valid account ID required' });
+    }
+
+    console.log(`🔄 Getting account status for: ${accountId}`);
+
+    const account = await stripe.accounts.retrieve(accountId);
+    
+    const isOnboarded = account.details_submitted && 
+                       account.charges_enabled && 
+                       account.payouts_enabled;
+    
+    const isEnabled = account.charges_enabled && account.payouts_enabled;
+
+    console.log(`✅ Account status retrieved for: ${accountId}, onboarded: ${isOnboarded}`);
+
+    res.json({
+      isOnboarded,
+      isEnabled,
+      requiresAction: account.requirements.currently_due.length > 0,
+      currentlyDue: account.requirements.currently_due,
+      message: 'Account status retrieved successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error getting account status:', error);
+    res.status(500).json({ 
+      error: 'Failed to get account status',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Process withdrawal (Stripe transfer only)
+app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
+  try {
+    const { accountId, amount, transferGroup } = req.body;
+
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ error: 'Valid account ID required' });
+    }
+
+    if (!amount || typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount required' });
+    }
+
+    // Convert amount to cents for Stripe
+    const amountInCents = Math.round(amount * 100);
+
+    if (amountInCents < 100) { // Minimum $1.00
+      return res.status(400).json({ error: 'Minimum withdrawal amount is $1.00' });
+    }
+
+    console.log(`🔄 Processing Stripe transfer: $${amount} to ${accountId}`);
+
+    // Create Stripe transfer
+    const transfer = await stripe.transfers.create({
+      amount: amountInCents,
+      currency: 'usd',
+      destination: accountId,
+      transfer_group: transferGroup,
+      metadata: {
+        type: 'withdrawal',
+        amount_dollars: amount.toFixed(2)
+      }
+    });
+
+    console.log(`✅ Stripe transfer completed: ${transfer.id}`);
+
+    res.json({
+      success: true,
+      transferId: transfer.id,
+      amount: amount,
+      message: 'Withdrawal processed successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing withdrawal:', error);
+    
+    // Handle specific Stripe errors
+    if (error.code === 'insufficient_funds') {
+      return res.status(400).json({ error: 'Insufficient funds in Stripe account' });
+    }
+    
+    if (error.code === 'account_invalid') {
+      return res.status(400).json({ error: 'Invalid Stripe Connect account' });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to process withdrawal',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Webhook endpoint for Stripe events (for production security)
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -183,6 +356,10 @@ app.use('*', (req, res) => {
       'GET /',
       'GET /health', 
       'POST /create-payment-intent',
+      'POST /stripe/create-express-account',
+      'POST /stripe/create-account-link', 
+      'POST /stripe/account-status',
+      'POST /stripe/process-withdrawal',
       'POST /webhook'
     ]
   });
