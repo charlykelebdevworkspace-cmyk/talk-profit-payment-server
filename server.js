@@ -229,11 +229,23 @@ app.post('/stripe/account-status', async (req, res) => {
     
     const isEnabled = account.charges_enabled && account.payouts_enabled;
 
+    let onboardingUrl = null;
+    if (!isOnboarded) {
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
+        return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
+        type: 'account_onboarding',
+      });
+      onboardingUrl = accountLink.url;
+    }
+
     console.log(`✅ Account status retrieved for: ${accountId}, onboarded: ${isOnboarded}`);
 
     res.json({
       isOnboarded,
       isEnabled,
+      onboardingUrl,
       requiresAction: account.requirements.currently_due.length > 0,
       currentlyDue: account.requirements.currently_due,
       message: 'Account status retrieved successfully'
