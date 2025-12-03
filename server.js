@@ -58,6 +58,9 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+// Webhook endpoint needs raw body, other endpoints need JSON
+app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 
 // Health check endpoint for Railway
@@ -477,7 +480,7 @@ async function handleTransferFailed(transfer) {
 }
 
 // Webhook endpoint for Stripe events (for production security)
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
