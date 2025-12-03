@@ -511,15 +511,28 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       const actionRequired = event.data.object;
       console.log(`⚠️ Payment requires action: ${actionRequired.id}`);
       break;
-    case 'transfer.paid':
+    case 'transfer.created':
       const transfer = event.data.object;
-      console.log(`✅ Transfer paid via webhook: ${transfer.id}`);
-      await handleTransferPaid(transfer);
+      console.log(`🔄 Transfer created via webhook: ${transfer.id}`);
+      // Transfer initiated, but not yet completed
       break;
-    case 'transfer.failed':
-      const failedTransfer = event.data.object;
-      console.log(`❌ Transfer failed via webhook: ${failedTransfer.id}`);
-      await handleTransferFailed(failedTransfer);
+    case 'transfer.updated':
+      const updatedTransfer = event.data.object;
+      console.log(`🔄 Transfer updated via webhook: ${updatedTransfer.id}, status: ${updatedTransfer.status}`);
+      if (updatedTransfer.status === 'paid') {
+        await handleTransferPaid(updatedTransfer);
+      } else if (updatedTransfer.status === 'failed') {
+        await handleTransferFailed(updatedTransfer);
+      }
+      break;
+    case 'payout.paid':
+      const payout = event.data.object;
+      console.log(`✅ Payout paid via webhook: ${payout.id}`);
+      // This might be when money actually hits the bank
+      break;
+    case 'payout.failed':
+      const failedPayout = event.data.object;
+      console.log(`❌ Payout failed via webhook: ${failedPayout.id}`);
       break;
     default:
       console.log(`ℹ️ Unhandled webhook event: ${event.type}`);
