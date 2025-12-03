@@ -6,12 +6,18 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Supabase client
+const supabaseUrl = process.env.VITE_SUPABASE_URL || 'https://jivutwbpnbphxyfwzyua.supabase.co';
+const supabaseKey = process.env.VITE_SUPABASE_PUBLISHABLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppdnV0d2JwbmJwaHh5Znd6eXVhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjIyNzkzMDIsImV4cCI6MjA3Nzg1NTMwMn0.w00O4oiS-hrlznCOW5R6s9x-pn2fk4dCvtFAGT3OQtU';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Trust proxy for rate limiting (Railway, Heroku, etc.)
 app.set('trust proxy', 1);
@@ -187,15 +193,28 @@ app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
 
     console.log(`🔄 Creating account link for: ${accountId}`);
 
+    // First, check if the account still exists and is valid
+    try {
+      const account = await stripe.accounts.retrieve(accountId);
+      console.log(`📊 Account retrieved: ${account.id}, type: ${account.type}`);
+    } catch (accountError) {
+      console.error('❌ Account not found or invalid:', accountError);
+      return res.status(400).json({ 
+        error: 'Invalid Stripe Connect account',
+        message: 'The account ID provided is not valid or no longer exists'
+      });
+    }
+
     // Create account link for onboarding
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
-      refresh_url: refreshUrl || `${process.env.FRONTEND_URL}/settings?stripe_refresh=true`,
-      return_url: returnUrl || `${process.env.FRONTEND_URL}/settings?stripe_return=true`,
+      refresh_url: refreshUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
+      return_url: returnUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
       type: 'account_onboarding',
     });
 
     console.log(`✅ Account link created for: ${accountId}`);
+    console.log(`🔗 Onboarding URL: ${accountLink.url}`);
 
     res.json({
       onboardingUrl: accountLink.url,
@@ -203,9 +222,18 @@ app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Error creating account link:', error);
+    
+    // Handle specific Stripe errors
+    if (error.code === 'account_invalid') {
+      return res.status(400).json({ 
+        error: 'Invalid account',
+        message: 'The Stripe Connect account is not valid for onboarding'
+      });
+    }
+    
     res.status(500).json({ 
       error: 'Failed to create account link',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Unable to create onboarding link'
     });
   }
 });
@@ -231,13 +259,21 @@ app.post('/stripe/account-status', async (req, res) => {
 
     let onboardingUrl = null;
     if (!isOnboarded) {
-      const accountLink = await stripe.accountLinks.create({
-        account: accountId,
-        refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
-        return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
-        type: 'account_onboarding',
-      });
-      onboardingUrl = accountLink.url;
+      try {
+        console.log(`🔗 Creating onboarding link for account: ${accountId}`);
+        const accountLink = await stripe.accountLinks.create({
+          account: accountId,
+          refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
+          return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
+          type: 'account_onboarding',
+        });
+        onboardingUrl = accountLink.url;
+        console.log(`✅ Onboarding link created: ${onboardingUrl}`);
+      } catch (linkError) {
+        console.error('❌ Error creating account link:', linkError);
+        // Don't fail the entire request, just don't provide onboarding URL
+        onboardingUrl = null;
+      }
     }
 
     console.log(`✅ Account status retrieved for: ${accountId}, onboarded: ${isOnboarded}`);
@@ -321,6 +357,125 @@ app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
   }
 });
 
+// Helper functions for webhook handling
+async function handleTransferPaid(transfer) {
+  try {
+    console.log(`🔄 Processing transfer.paid for: ${transfer.id}`);
+    
+    // Find the withdrawal request by transfer ID
+    const { data: withdrawalRequest, error: findError } = await supabase
+      .from('withdrawal_requests')
+      .select('*')
+      .eq('stripe_transfer_id', transfer.id)
+      .single();
+
+    if (findError || !withdrawalRequest) {
+      console.error('❌ Could not find withdrawal request for transfer:', transfer.id);
+      return;
+    }
+
+    console.log(`📋 Found withdrawal request: ${withdrawalRequest.id} for user: ${withdrawalRequest.user_id}`);
+
+    // Get user's current earnings
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('earnings')
+      .eq('user_id', withdrawalRequest.user_id)
+      .single();
+
+    if (walletError || !wallet) {
+      console.error('❌ Could not find wallet for user:', withdrawalRequest.user_id);
+      return;
+    }
+
+    // Calculate new earnings (subtract withdrawn amount)
+    const newEarnings = Math.max(0, wallet.earnings - withdrawalRequest.amount);
+    
+    // Update withdrawal status to completed and reduce earnings
+    const { error: updateError } = await supabase
+      .from('withdrawal_requests')
+      .update({
+        status: 'completed',
+        processed_at: new Date().toISOString()
+      })
+      .eq('id', withdrawalRequest.id);
+
+    if (updateError) {
+      console.error('❌ Failed to update withdrawal request:', updateError);
+      return;
+    }
+
+    // Reduce user earnings
+    const { error: earningsError } = await supabase
+      .from('wallets')
+      .update({ earnings: newEarnings })
+      .eq('user_id', withdrawalRequest.user_id);
+
+    if (earningsError) {
+      console.error('❌ Failed to update user earnings:', earningsError);
+      return;
+    }
+
+    // Create transaction record
+    const { error: transactionError } = await supabase
+      .from('transactions')
+      .insert({
+        from_user_id: withdrawalRequest.user_id,
+        to_user_id: null, // External withdrawal
+        amount: -withdrawalRequest.amount, // Negative for withdrawal
+        transaction_type: 'withdrawal',
+        description: `Withdrawal completed: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})`
+      });
+
+    if (transactionError) {
+      console.error('❌ Failed to create transaction record:', transactionError);
+    }
+
+    console.log(`✅ Transfer completed successfully: $${withdrawalRequest.amount} for user ${withdrawalRequest.user_id}`);
+  } catch (error) {
+    console.error('❌ Error handling transfer.paid:', error);
+  }
+}
+
+async function handleTransferFailed(transfer) {
+  try {
+    console.log(`🔄 Processing transfer.failed for: ${transfer.id}`);
+    
+    // Find the withdrawal request by transfer ID
+    const { data: withdrawalRequest, error: findError } = await supabase
+      .from('withdrawal_requests')
+      .select('*')
+      .eq('stripe_transfer_id', transfer.id)
+      .single();
+
+    if (findError || !withdrawalRequest) {
+      console.error('❌ Could not find withdrawal request for transfer:', transfer.id);
+      return;
+    }
+
+    console.log(`📋 Found failed withdrawal request: ${withdrawalRequest.id} for user: ${withdrawalRequest.user_id}`);
+
+    // Update withdrawal status to failed (keep earnings unchanged)
+    const { error: updateError } = await supabase
+      .from('withdrawal_requests')
+      .update({
+        status: 'failed',
+        failure_reason: transfer.failure_message || 'Transfer failed',
+        processed_at: new Date().toISOString()
+      })
+      .eq('id', withdrawalRequest.id);
+
+    if (updateError) {
+      console.error('❌ Failed to update withdrawal request:', updateError);
+      return;
+    }
+
+    console.log(`✅ Transfer failure handled: ${withdrawalRequest.id}, earnings preserved`);
+  } catch (error) {
+    console.error('❌ Error handling transfer.failed:', error);
+  }
+}
+
 // Webhook endpoint for Stripe events (for production security)
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -355,6 +510,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     case 'payment_intent.requires_action':
       const actionRequired = event.data.object;
       console.log(`⚠️ Payment requires action: ${actionRequired.id}`);
+      break;
+    case 'transfer.paid':
+      const transfer = event.data.object;
+      console.log(`✅ Transfer paid via webhook: ${transfer.id}`);
+      await handleTransferPaid(transfer);
+      break;
+    case 'transfer.failed':
+      const failedTransfer = event.data.object;
+      console.log(`❌ Transfer failed via webhook: ${failedTransfer.id}`);
+      await handleTransferFailed(failedTransfer);
       break;
     default:
       console.log(`ℹ️ Unhandled webhook event: ${event.type}`);
