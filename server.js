@@ -391,10 +391,7 @@ async function handleTransferPaid(transfer) {
       return;
     }
 
-    // Calculate new earnings (subtract withdrawn amount)
-    const newEarnings = Math.max(0, wallet.earnings - withdrawalRequest.amount);
-    
-    // Update withdrawal status to completed and reduce earnings
+    // Update withdrawal status to completed (earnings already deducted)
     const { error: updateError } = await supabase
       .from('withdrawal_requests')
       .update({
@@ -408,27 +405,15 @@ async function handleTransferPaid(transfer) {
       return;
     }
 
-    // Reduce user earnings
-    const { error: earningsError } = await supabase
-      .from('wallets')
-      .update({ earnings: newEarnings })
-      .eq('user_id', withdrawalRequest.user_id);
-
-    if (earningsError) {
-      console.error('❌ Failed to update user earnings:', earningsError);
-      return;
-    }
-
-    // Create transaction record
+    // Update transaction record to show completion
     const { error: transactionError } = await supabase
       .from('transactions')
-      .insert({
-        from_user_id: withdrawalRequest.user_id,
-        to_user_id: null, // External withdrawal
-        amount: -withdrawalRequest.amount, // Negative for withdrawal
-        transaction_type: 'withdrawal',
+      .update({
         description: `Withdrawal completed: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})`
-      });
+      })
+      .eq('from_user_id', withdrawalRequest.user_id)
+      .eq('amount', -withdrawalRequest.amount)
+      .eq('transaction_type', 'withdrawal');
 
     if (transactionError) {
       console.error('❌ Failed to create transaction record:', transactionError);
@@ -458,7 +443,31 @@ async function handleTransferFailed(transfer) {
 
     console.log(`📋 Found failed withdrawal request: ${withdrawalRequest.id} for user: ${withdrawalRequest.user_id}`);
 
-    // Update withdrawal status to failed (keep earnings unchanged)
+    // Get user's current earnings to refund the amount
+    const { data: wallet, error: walletError } = await supabase
+      .from('wallets')
+      .select('earnings')
+      .eq('user_id', withdrawalRequest.user_id)
+      .single();
+
+    if (walletError || !wallet) {
+      console.error('❌ Could not find wallet for refund:', withdrawalRequest.user_id);
+      return;
+    }
+
+    // Refund the withdrawal amount back to earnings
+    const refundedEarnings = wallet.earnings + withdrawalRequest.amount;
+    const { error: refundError } = await supabase
+      .from('wallets')
+      .update({ earnings: refundedEarnings })
+      .eq('user_id', withdrawalRequest.user_id);
+
+    if (refundError) {
+      console.error('❌ Failed to refund earnings:', refundError);
+      return;
+    }
+
+    // Update withdrawal status to failed
     const { error: updateError } = await supabase
       .from('withdrawal_requests')
       .update({
@@ -473,7 +482,21 @@ async function handleTransferFailed(transfer) {
       return;
     }
 
-    console.log(`✅ Transfer failure handled: ${withdrawalRequest.id}, earnings preserved`);
+    // Update transaction record to show refund
+    const { error: transactionError } = await supabase
+      .from('transactions')
+      .update({
+        description: `Withdrawal failed - refunded: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})`
+      })
+      .eq('from_user_id', withdrawalRequest.user_id)
+      .eq('amount', -withdrawalRequest.amount)
+      .eq('transaction_type', 'withdrawal');
+
+    if (transactionError) {
+      console.error('❌ Failed to update transaction record:', transactionError);
+    }
+
+    console.log(`✅ Transfer failure handled: ${withdrawalRequest.id}, $${withdrawalRequest.amount} refunded to earnings`);
   } catch (error) {
     console.error('❌ Error handling transfer.failed:', error);
   }
