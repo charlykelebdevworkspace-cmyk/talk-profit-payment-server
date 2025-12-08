@@ -49,6 +49,7 @@ const corsOptions = {
     'http://localhost:3000',
     'http://localhost:8080',  // Added for your current dev setup
     'https://talk-profit-link.vercel.app', // Add your production frontend URL
+    'https://preview--talk-profit-link.lovable.app', // Lovable preview domain
     process.env.FRONTEND_URL,
     process.env.ALLOWED_ORIGIN
   ].filter(Boolean),
