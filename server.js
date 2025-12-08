@@ -44,15 +44,26 @@ const paymentLimiter = rateLimit({
 
 // CORS configuration for production
 const corsOptions = {
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'http://localhost:8080',  // Added for your current dev setup
-    'https://talk-profit-link.vercel.app', // Add your production frontend URL
-    'https://preview--talk-profit-link.lovable.app', // Lovable preview domain
-    process.env.FRONTEND_URL,
-    process.env.ALLOWED_ORIGIN
-  ].filter(Boolean),
+  origin: function (origin, callback) {
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'http://localhost:8080',
+      'https://talk-profit-link.vercel.app',
+      process.env.FRONTEND_URL,
+      process.env.ALLOWED_ORIGIN
+    ].filter(Boolean);
+
+    // Allow any Lovable.app subdomain
+    const isLovableDomain = origin && origin.includes('.lovable.app');
+    
+    // Allow if origin is in allowed list or is a Lovable domain
+    if (!origin || allowedOrigins.includes(origin) || isLovableDomain) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: false
