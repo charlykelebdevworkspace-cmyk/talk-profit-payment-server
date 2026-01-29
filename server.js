@@ -50,6 +50,7 @@ const corsOptions = {
       'http://localhost:3000',
       'http://localhost:8080',
       'https://talk-profit-link.vercel.app',
+      'https://yapski.com',
       process.env.FRONTEND_URL,
       process.env.ALLOWED_ORIGIN
     ].filter(Boolean);
