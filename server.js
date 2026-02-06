@@ -311,6 +311,41 @@ app.post('/stripe/account-status', async (req, res) => {
   }
 });
 
+// Get Stripe account balance
+app.get('/stripe/balance', async (req, res) => {
+  try {
+    console.log('🔄 Fetching Stripe balance...');
+
+    const balance = await stripe.balance.retrieve();
+
+    // Convert from cents to dollars
+    const available = balance.available.map(b => ({
+      amount: b.amount / 100,
+      currency: b.currency.toUpperCase()
+    }));
+
+    const pending = balance.pending.map(b => ({
+      amount: b.amount / 100,
+      currency: b.currency.toUpperCase()
+    }));
+
+    console.log(`✅ Balance retrieved - Available: $${available[0]?.amount || 0}, Pending: $${pending[0]?.amount || 0}`);
+
+    res.json({
+      available,
+      pending,
+      message: 'Balance retrieved successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching balance:', error);
+    res.status(500).json({
+      error: 'Failed to fetch balance',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Process withdrawal (Stripe transfer only)
 app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
   try {
@@ -331,7 +366,22 @@ app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Minimum withdrawal amount is $1.00' });
     }
 
+    // Check balance first
+    const balance = await stripe.balance.retrieve();
+    const availableBalance = balance.available[0]?.amount || 0;
+
     console.log(`🔄 Processing Stripe transfer: $${amount} to ${accountId}`);
+    console.log(`💰 Available balance: $${availableBalance / 100}`);
+
+    if (availableBalance < amountInCents) {
+      console.error(`❌ Insufficient balance: Available $${availableBalance / 100}, Requested $${amount}`);
+      return res.status(400).json({
+        error: 'Insufficient funds in Stripe account',
+        message: 'Your Stripe account may have automatic payouts enabled. Enable manual payouts at https://dashboard.stripe.com/account/payouts',
+        availableBalance: availableBalance / 100,
+        requestedAmount: amount
+      });
+    }
 
     // Create Stripe transfer
     const transfer = await stripe.transfers.create({
@@ -356,17 +406,21 @@ app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error processing withdrawal:', error);
-    
+
     // Handle specific Stripe errors
-    if (error.code === 'insufficient_funds') {
-      return res.status(400).json({ error: 'Insufficient funds in Stripe account' });
+    if (error.code === 'insufficient_funds' || error.code === 'balance_insufficient') {
+      return res.status(400).json({
+        error: 'Insufficient funds in Stripe account',
+        message: 'Your Stripe account may have automatic payouts enabled. Enable manual payouts at https://dashboard.stripe.com/account/payouts',
+        helpUrl: 'https://dashboard.stripe.com/account/payouts'
+      });
     }
-    
+
     if (error.code === 'account_invalid') {
       return res.status(400).json({ error: 'Invalid Stripe Connect account' });
     }
 
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to process withdrawal',
       message: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -582,14 +636,15 @@ app.post('/webhook', async (req, res) => {
 
 // 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({ 
+  res.status(404).json({
     error: 'Endpoint not found',
     available_endpoints: [
       'GET /',
-      'GET /health', 
+      'GET /health',
+      'GET /stripe/balance',
       'POST /create-payment-intent',
       'POST /stripe/create-express-account',
-      'POST /stripe/create-account-link', 
+      'POST /stripe/create-account-link',
       'POST /stripe/account-status',
       'POST /stripe/process-withdrawal',
       'POST /webhook'
