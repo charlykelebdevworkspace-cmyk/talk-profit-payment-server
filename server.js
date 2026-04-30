@@ -1,48 +1,69 @@
-// TalkProfit Stripe Payment Server
-// Optimized for Railway deployment
-
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
+const Stripe = require('stripe');
+const { createClient } = require('@supabase/supabase-js');
+const twilio = require('twilio');
+const fetch = require('node-fetch');
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize Supabase client
-const supabaseUrl = process.env.VITE_SUPABASE_URL || 'https://jivutwbpnbphxyfwzyua.supabase.co';
-const supabaseKey = process.env.VITE_SUPABASE_PUBLISHABLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppdnV0d2JwbmJwaHh5Znd6eXVhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjIyNzkzMDIsImV4cCI6MjA3Nzg1NTMwMn0.w00O4oiS-hrlznCOW5R6s9x-pn2fk4dCvtFAGT3OQtU';
-const supabase = createClient(supabaseUrl, supabaseKey);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Trust proxy for rate limiting (Railway, Heroku, etc.)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const twilioClient = twilio(
+  process.env.TWILIO_API_KEY,
+  process.env.TWILIO_API_SECRET,
+  { accountSid: process.env.TWILIO_ACCOUNT_SID }
+);
+
+const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+
 app.set('trust proxy', 1);
 
-// Security middleware
 app.use(helmet());
 
-// Rate limiting - prevent abuse
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   message: { error: 'Too many requests, please try again later' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use(limiter);
 
-// Payment-specific rate limiting
 const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 5, // Max 5 payment attempts per minute per IP
+  windowMs: 60 * 1000,
+  max: 5,
   message: { error: 'Too many payment attempts, please wait before trying again' },
 });
 
-// CORS configuration for production
+const isLovablePreview = (origin) => {
+  if (!origin) return false;
+  try {
+    const url = new URL(origin);
+    const host = url.hostname;
+    return (
+      host.endsWith('.lovable.app') ||
+      host.endsWith('.lovableproject.com') ||
+      host === 'lovable.app' ||
+      host === 'lovableproject.com'
+    );
+  } catch {
+    return false;
+  }
+};
+
 const corsOptions = {
   origin: function (origin, callback) {
     const allowedOrigins = [
@@ -52,111 +73,166 @@ const corsOptions = {
       'https://talk-profit-link.vercel.app',
       'https://yapski.com',
       process.env.FRONTEND_URL,
-      process.env.ALLOWED_ORIGIN
+      process.env.PREVIEW_ORIGIN,
+      process.env.ALLOWED_ORIGIN,
     ].filter(Boolean);
 
-    // Allow any Lovable.app subdomain
-    const isLovableDomain = origin && origin.includes('.lovable.app');
-    
-    // Allow if origin is in allowed list or is a Lovable domain
-    if (!origin || allowedOrigins.includes(origin) || isLovableDomain) {
+    if (!origin || allowedOrigins.includes(origin) || isLovablePreview(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
     }
   },
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false
+  credentials: true,
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
 
-// Webhook endpoint needs raw body, other endpoints need JSON
-app.use('/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json({ limit: '10mb' }));
+// Webhook routes must be before express.json() to get raw body for signature verification
+app.post(
+  '/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers['stripe-signature'],
+        STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Stripe webhook signature failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
-// Health check endpoint for Railway
+    try {
+      await handleStripeEvent(event);
+      res.json({ received: true });
+    } catch (err) {
+      console.error('Stripe webhook handler error:', err);
+      res.status(500).json({ error: 'webhook handler failed' });
+    }
+  }
+);
+
+// Legacy webhook path for backwards compatibility
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  if (!STRIPE_WEBHOOK_SECRET) {
+    console.warn('Webhook secret not configured - skipping verification');
+    return res.status(200).json({ received: true });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).json({ error: 'Invalid webhook signature' });
+  }
+
+  try {
+    await handleStripeEvent(event);
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    res.status(500).json({ error: 'webhook handler failed' });
+  }
+});
+
+app.post(
+  '/twilio/recording-webhook',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    try {
+      await handleTwilioRecordingEvent(req.body);
+      res.status(200).send('ok');
+    } catch (err) {
+      console.error('Twilio recording webhook error:', err);
+      res.status(500).send('error');
+    }
+  }
+);
+
+app.use(express.json({ limit: '10mb' }));
+app.options('*', cors(corsOptions));
+
+const verifyToken = async (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Token verification failed' });
+  }
+};
+
+// Health check
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'TalkProfit Payment Server Running',
-    version: '1.0.0',
+    version: '2.0.0',
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: process.env.NODE_ENV || 'development',
   });
 });
 
-// Health check specifically for Railway
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy' });
+  res.status(200).json({ status: 'healthy', service: 'talk-profit-payment-server' });
 });
 
-// Create Payment Intent endpoint
+// Create Payment Intent (credit top-up)
 app.post('/create-payment-intent', paymentLimiter, async (req, res) => {
   try {
     const { amount, currency = 'usd', userId } = req.body;
 
-    // Comprehensive validation
     if (!process.env.STRIPE_SECRET_KEY) {
-      console.error('❌ STRIPE_SECRET_KEY not configured');
       return res.status(500).json({ error: 'Payment service not configured' });
     }
-
     if (!amount || typeof amount !== 'number') {
       return res.status(400).json({ error: 'Invalid amount format' });
     }
-
-    if (amount < 100) { // Minimum $1.00
-      return res.status(400).json({ error: 'Minimum amount is $1.00' });
-    }
-
-    if (amount > 100000) { // Maximum $1000.00
-      return res.status(400).json({ error: 'Maximum amount is $1000.00' });
-    }
-
+    if (amount < 100) return res.status(400).json({ error: 'Minimum amount is $1.00' });
+    if (amount > 100000) return res.status(400).json({ error: 'Maximum amount is $1000.00' });
     if (!userId || typeof userId !== 'string') {
       return res.status(400).json({ error: 'Valid user ID required' });
     }
 
-    console.log(`🔄 Creating payment intent: $${amount/100} for user ${userId}`);
-
-    // Create PaymentIntent with Stripe
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount, // Amount in cents
-      currency: currency,
+      amount,
+      currency,
       metadata: {
-        userId: userId,
+        userId,
         type: 'credit_topup',
         timestamp: new Date().toISOString(),
-        source: 'talkprofit_web'
+        source: 'talkprofit_web',
       },
-      automatic_payment_methods: {
-        enabled: true,
-      },
-      description: `TalkProfit Credit Top-up: $${(amount/100).toFixed(2)}`,
+      automatic_payment_methods: { enabled: true },
+      description: `TalkProfit Credit Top-up: $${(amount / 100).toFixed(2)}`,
     });
-
-    console.log(`✅ Payment intent created: ${paymentIntent.id}`);
 
     res.json({
       client_secret: paymentIntent.client_secret,
       payment_intent_id: paymentIntent.id,
     });
   } catch (error) {
-    console.error('❌ Error creating payment intent:', error);
-    
-    // Handle specific Stripe errors
+    console.error('Error creating payment intent:', error);
     if (error.code === 'api_key_invalid') {
       return res.status(500).json({ error: 'Payment service configuration error' });
     }
-    
     if (error.code === 'rate_limit') {
       return res.status(429).json({ error: 'Service temporarily busy, please try again' });
     }
-
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Unable to process payment request',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }
 });
@@ -164,41 +240,45 @@ app.post('/create-payment-intent', paymentLimiter, async (req, res) => {
 // Create Stripe Connect Express account
 app.post('/stripe/create-express-account', paymentLimiter, async (req, res) => {
   try {
-    const { email } = req.body;
+    const { userId, email, returnUrl, refreshUrl } = req.body;
 
     if (!email || typeof email !== 'string') {
       return res.status(400).json({ error: 'Valid email required' });
     }
 
-    console.log(`🔄 Creating Stripe Express account for email: ${email}`);
-
-    // Create Stripe Express account
     const account = await stripe.accounts.create({
       type: 'express',
-      email: email,
+      email,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
       },
       business_type: 'individual',
+      metadata: { userId: userId || '' },
     });
 
-    console.log(`✅ Stripe Express account created: ${account.id}`);
+    // If returnUrl provided, also create the onboarding link in one call
+    if (returnUrl) {
+      const accountLink = await stripe.accountLinks.create({
+        account: account.id,
+        refresh_url: refreshUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
+        return_url: returnUrl,
+        type: 'account_onboarding',
+      });
+      return res.json({ accountId: account.id, onboardingUrl: accountLink.url });
+    }
 
-    res.json({
-      accountId: account.id,
-      message: 'Express account created successfully'
-    });
+    res.json({ accountId: account.id, message: 'Express account created successfully' });
   } catch (error) {
-    console.error('❌ Error creating Express account:', error);
-    res.status(500).json({ 
+    console.error('Error creating Express account:', error);
+    res.status(500).json({
       error: 'Failed to create Express account',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }
 });
 
-// Create account onboarding link
+// Create account onboarding link (separate step)
 app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
   try {
     const { accountId, returnUrl, refreshUrl } = req.body;
@@ -207,21 +287,15 @@ app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Valid account ID required' });
     }
 
-    console.log(`🔄 Creating account link for: ${accountId}`);
-
-    // First, check if the account still exists and is valid
     try {
-      const account = await stripe.accounts.retrieve(accountId);
-      console.log(`📊 Account retrieved: ${account.id}, type: ${account.type}`);
+      await stripe.accounts.retrieve(accountId);
     } catch (accountError) {
-      console.error('❌ Account not found or invalid:', accountError);
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Invalid Stripe Connect account',
-        message: 'The account ID provided is not valid or no longer exists'
+        message: 'The account ID provided is not valid or no longer exists',
       });
     }
 
-    // Create account link for onboarding
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
       refresh_url: refreshUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
@@ -229,27 +303,15 @@ app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
       type: 'account_onboarding',
     });
 
-    console.log(`✅ Account link created for: ${accountId}`);
-    console.log(`🔗 Onboarding URL: ${accountLink.url}`);
-
-    res.json({
-      onboardingUrl: accountLink.url,
-      message: 'Account link created successfully'
-    });
+    res.json({ onboardingUrl: accountLink.url, message: 'Account link created successfully' });
   } catch (error) {
-    console.error('❌ Error creating account link:', error);
-    
-    // Handle specific Stripe errors
+    console.error('Error creating account link:', error);
     if (error.code === 'account_invalid') {
-      return res.status(400).json({ 
-        error: 'Invalid account',
-        message: 'The Stripe Connect account is not valid for onboarding'
-      });
+      return res.status(400).json({ error: 'Invalid account' });
     }
-    
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to create account link',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Unable to create onboarding link'
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Unable to create onboarding link',
     });
   }
 });
@@ -263,20 +325,13 @@ app.post('/stripe/account-status', async (req, res) => {
       return res.status(400).json({ error: 'Valid account ID required' });
     }
 
-    console.log(`🔄 Getting account status for: ${accountId}`);
-
     const account = await stripe.accounts.retrieve(accountId);
-    
-    const isOnboarded = account.details_submitted && 
-                       account.charges_enabled && 
-                       account.payouts_enabled;
-    
+    const isOnboarded = account.details_submitted && account.charges_enabled && account.payouts_enabled;
     const isEnabled = account.charges_enabled && account.payouts_enabled;
 
     let onboardingUrl = null;
     if (!isOnboarded) {
       try {
-        console.log(`🔗 Creating onboarding link for account: ${accountId}`);
         const accountLink = await stripe.accountLinks.create({
           account: accountId,
           refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
@@ -284,15 +339,10 @@ app.post('/stripe/account-status', async (req, res) => {
           type: 'account_onboarding',
         });
         onboardingUrl = accountLink.url;
-        console.log(`✅ Onboarding link created: ${onboardingUrl}`);
       } catch (linkError) {
-        console.error('❌ Error creating account link:', linkError);
-        // Don't fail the entire request, just don't provide onboarding URL
-        onboardingUrl = null;
+        console.error('Error creating account link:', linkError);
       }
     }
-
-    console.log(`✅ Account status retrieved for: ${accountId}, onboarded: ${isOnboarded}`);
 
     res.json({
       isOnboarded,
@@ -300,338 +350,558 @@ app.post('/stripe/account-status', async (req, res) => {
       onboardingUrl,
       requiresAction: account.requirements.currently_due.length > 0,
       currentlyDue: account.requirements.currently_due,
-      message: 'Account status retrieved successfully'
+      message: 'Account status retrieved successfully',
     });
   } catch (error) {
-    console.error('❌ Error getting account status:', error);
-    res.status(500).json({ 
+    console.error('Error getting account status:', error);
+    res.status(500).json({
       error: 'Failed to get account status',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }
 });
 
-// Get Stripe account balance
+// Get Stripe platform balance
 app.get('/stripe/balance', async (req, res) => {
   try {
-    console.log('🔄 Fetching Stripe balance...');
-
     const balance = await stripe.balance.retrieve();
 
-    // Convert from cents to dollars
     const available = balance.available.map(b => ({
       amount: b.amount / 100,
-      currency: b.currency.toUpperCase()
+      currency: b.currency.toUpperCase(),
     }));
-
     const pending = balance.pending.map(b => ({
       amount: b.amount / 100,
-      currency: b.currency.toUpperCase()
+      currency: b.currency.toUpperCase(),
     }));
 
-    console.log(`✅ Balance retrieved - Available: $${available[0]?.amount || 0}, Pending: $${pending[0]?.amount || 0}`);
-
-    res.json({
-      available,
-      pending,
-      message: 'Balance retrieved successfully'
-    });
-
+    res.json({ available, pending, message: 'Balance retrieved successfully' });
   } catch (error) {
-    console.error('❌ Error fetching balance:', error);
+    console.error('Error fetching balance:', error);
     res.status(500).json({
       error: 'Failed to fetch balance',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }
 });
 
-// Process withdrawal (Stripe transfer only)
+// Process withdrawal
 app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
   try {
-    const { accountId, amount, transferGroup } = req.body;
+    const { withdrawalRequestId, accountId, amount, transferGroup } = req.body;
 
     if (!accountId || typeof accountId !== 'string') {
       return res.status(400).json({ error: 'Valid account ID required' });
     }
-
     if (!amount || typeof amount !== 'number' || amount <= 0) {
       return res.status(400).json({ error: 'Valid amount required' });
     }
 
-    // Convert amount to cents for Stripe
     const amountInCents = Math.round(amount * 100);
-
-    if (amountInCents < 100) { // Minimum $1.00
+    if (amountInCents < 100) {
       return res.status(400).json({ error: 'Minimum withdrawal amount is $1.00' });
     }
 
-    // Check balance first
-    const balance = await stripe.balance.retrieve();
-    const availableBalance = balance.available[0]?.amount || 0;
-
-    console.log(`🔄 Processing Stripe transfer: $${amount} to ${accountId}`);
-    console.log(`💰 Available balance: $${availableBalance / 100}`);
-
-    if (availableBalance < amountInCents) {
-      console.error(`❌ Insufficient balance: Available $${availableBalance / 100}, Requested $${amount}`);
-      return res.status(400).json({
-        error: 'Insufficient funds in Stripe account',
-        message: 'Your Stripe account may have automatic payouts enabled. Enable manual payouts at https://dashboard.stripe.com/account/payouts',
-        availableBalance: availableBalance / 100,
-        requestedAmount: amount
-      });
-    }
-
-    // Create Stripe transfer
-    const transfer = await stripe.transfers.create({
-      amount: amountInCents,
-      currency: 'usd',
-      destination: accountId,
-      transfer_group: transferGroup,
-      metadata: {
-        type: 'withdrawal',
-        amount_dollars: amount.toFixed(2)
+    // New flow: withdrawalRequestId provided — manage DB state in backend
+    if (withdrawalRequestId) {
+      const token = req.headers.authorization?.replace('Bearer ', '');
+      let userId = null;
+      if (token) {
+        const { data: { user } } = await supabase.auth.getUser(token);
+        userId = user?.id;
       }
-    });
 
-    console.log(`✅ Stripe transfer completed: ${transfer.id}`);
+      try {
+        const { data: withdrawalRequest, error: fetchError } = await supabase
+          .from('withdrawal_requests')
+          .select('*')
+          .eq('id', withdrawalRequestId)
+          .eq('status', 'pending')
+          .single();
 
-    res.json({
-      success: true,
-      transferId: transfer.id,
-      amount: amount,
-      message: 'Withdrawal processed successfully'
-    });
+        if (fetchError || !withdrawalRequest) throw new Error('Invalid withdrawal request');
 
-  } catch (error) {
-    console.error('❌ Error processing withdrawal:', error);
+        const { data: wallet, error: walletError } = await supabase
+          .from('wallets')
+          .select('earnings')
+          .eq('user_id', withdrawalRequest.user_id)
+          .single();
 
-    // Handle specific Stripe errors
-    if (error.code === 'insufficient_funds' || error.code === 'balance_insufficient') {
-      return res.status(400).json({
-        error: 'Insufficient funds in Stripe account',
-        message: 'Your Stripe account may have automatic payouts enabled. Enable manual payouts at https://dashboard.stripe.com/account/payouts',
-        helpUrl: 'https://dashboard.stripe.com/account/payouts'
-      });
+        if (walletError || !wallet || wallet.earnings < amount) throw new Error('Insufficient earnings');
+
+        await supabase
+          .from('withdrawal_requests')
+          .update({ status: 'processing' })
+          .eq('id', withdrawalRequestId);
+
+        const transfer = await stripe.transfers.create({
+          amount: amountInCents,
+          currency: 'usd',
+          destination: accountId,
+          metadata: { withdrawalRequestId, userId: withdrawalRequest.user_id },
+        });
+
+        await supabase
+          .from('wallets')
+          .update({ earnings: wallet.earnings - amount })
+          .eq('user_id', withdrawalRequest.user_id);
+
+        await supabase
+          .from('withdrawal_requests')
+          .update({ status: 'completed', stripe_transfer_id: transfer.id, processed_at: new Date().toISOString() })
+          .eq('id', withdrawalRequestId);
+
+        await supabase.from('transactions').insert({
+          from_user_id: withdrawalRequest.user_id,
+          to_user_id: null,
+          amount: -amount,
+          transaction_type: 'withdrawal',
+          description: `Withdrawal to Stripe Connect account: $${amount.toFixed(2)}`,
+        });
+
+        return res.json({ success: true, transferId: transfer.id, message: 'Withdrawal processed successfully' });
+      } catch (error) {
+        await supabase
+          .from('withdrawal_requests')
+          .update({ status: 'failed', failure_reason: error.message, processed_at: new Date().toISOString() })
+          .eq('id', withdrawalRequestId);
+        throw error;
+      }
     }
 
+    // Legacy flow: no withdrawalRequestId — frontend manages DB state
+    try {
+      const transfer = await stripe.transfers.create({
+        amount: amountInCents,
+        currency: 'usd',
+        destination: accountId,
+        transfer_group: transferGroup,
+        metadata: { type: 'withdrawal', amount_dollars: amount.toFixed(2) },
+      });
+
+      return res.json({ success: true, transferId: transfer.id, amount, message: 'Withdrawal processed successfully' });
+    } catch (stripeError) {
+      if (stripeError.code === 'insufficient_funds' || stripeError.code === 'balance_insufficient') {
+        return res.status(202).json({
+          success: true,
+          pending: true,
+          amount,
+          message: 'Withdrawal request accepted and will be processed within 7-14 business days',
+        });
+      }
+      throw stripeError;
+    }
+  } catch (error) {
+    console.error('Error processing withdrawal:', error);
     if (error.code === 'account_invalid') {
       return res.status(400).json({ error: 'Invalid Stripe Connect account' });
     }
-
     res.status(500).json({
       error: 'Failed to process withdrawal',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Please try again or contact support',
     });
   }
 });
 
-// Helper functions for webhook handling
+// ============================================================
+// Call Recording Subscription
+// ============================================================
+
+async function getOrCreateStripeCustomer(userId, email) {
+  const { data: existing } = await supabase
+    .from('subscriptions')
+    .select('stripe_customer_id')
+    .eq('user_id', userId)
+    .not('stripe_customer_id', 'is', null)
+    .limit(1)
+    .maybeSingle();
+
+  if (existing?.stripe_customer_id) return existing.stripe_customer_id;
+
+  const customer = await stripe.customers.create({
+    email,
+    metadata: { user_id: userId },
+  });
+  return customer.id;
+}
+
+app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) => {
+  try {
+    if (!STRIPE_RECORDING_PRICE_ID) {
+      return res.status(500).json({ error: 'STRIPE_RECORDING_PRICE_ID not configured' });
+    }
+    const { successUrl, cancelUrl } = req.body;
+    const customerId = await getOrCreateStripeCustomer(req.user.id, req.user.email);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: STRIPE_RECORDING_PRICE_ID, quantity: 1 }],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: { user_id: req.user.id, product: 'call_recording' },
+      subscription_data: {
+        metadata: { user_id: req.user.id, product: 'call_recording' },
+      },
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error('Create subscription checkout failed:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
+  try {
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('stripe_subscription_id')
+      .eq('user_id', req.user.id)
+      .eq('product', 'call_recording')
+      .in('status', ['active', 'trialing', 'past_due'])
+      .maybeSingle();
+
+    if (!sub?.stripe_subscription_id) {
+      return res.status(404).json({ error: 'No active subscription' });
+    }
+
+    const updated = await stripe.subscriptions.update(sub.stripe_subscription_id, {
+      cancel_at_period_end: true,
+    });
+
+    await supabase
+      .from('subscriptions')
+      .update({ cancel_at_period_end: true })
+      .eq('stripe_subscription_id', sub.stripe_subscription_id);
+
+    res.json({ success: true, cancel_at_period_end: updated.cancel_at_period_end });
+  } catch (error) {
+    console.error('Cancel subscription failed:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+// ============================================================
+// Stripe webhook event handler
+// ============================================================
+
+async function handleStripeEvent(event) {
+  const obj = event.data.object;
+
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      console.log(`Payment succeeded: ${obj.id}`);
+      break;
+    case 'payment_intent.payment_failed':
+      console.log(`Payment failed: ${obj.id}`);
+      break;
+    case 'checkout.session.completed': {
+      if (obj.mode !== 'subscription') return;
+      const userId = obj.metadata?.user_id;
+      if (!userId) return;
+      const subscription = await stripe.subscriptions.retrieve(obj.subscription);
+      await upsertSubscriptionRow(userId, subscription, obj.customer);
+      break;
+    }
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted': {
+      const userId = obj.metadata?.user_id;
+      if (!userId) return;
+      await upsertSubscriptionRow(userId, obj, obj.customer);
+      break;
+    }
+    case 'transfer.updated': {
+      if (obj.status === 'paid') await handleTransferPaid(obj);
+      else if (obj.status === 'failed') await handleTransferFailed(obj);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+async function upsertSubscriptionRow(userId, subscription, customerId) {
+  await supabase.from('subscriptions').upsert(
+    {
+      user_id: userId,
+      product: subscription.metadata?.product || 'call_recording',
+      stripe_customer_id: typeof customerId === 'string' ? customerId : customerId?.id,
+      stripe_subscription_id: subscription.id,
+      status: subscription.status,
+      current_period_end: subscription.current_period_end
+        ? new Date(subscription.current_period_end * 1000).toISOString()
+        : null,
+      cancel_at_period_end: !!subscription.cancel_at_period_end,
+    },
+    { onConflict: 'stripe_subscription_id' }
+  );
+}
+
 async function handleTransferPaid(transfer) {
   try {
-    console.log(`🔄 Processing transfer.paid for: ${transfer.id}`);
-    
-    // Find the withdrawal request by transfer ID
     const { data: withdrawalRequest, error: findError } = await supabase
       .from('withdrawal_requests')
       .select('*')
       .eq('stripe_transfer_id', transfer.id)
       .single();
 
-    if (findError || !withdrawalRequest) {
-      console.error('❌ Could not find withdrawal request for transfer:', transfer.id);
-      return;
-    }
+    if (findError || !withdrawalRequest) return;
 
-    console.log(`📋 Found withdrawal request: ${withdrawalRequest.id} for user: ${withdrawalRequest.user_id}`);
-
-    // Get user's current earnings
-    const { data: wallet, error: walletError } = await supabase
-      .from('wallets')
-      .select('earnings')
-      .eq('user_id', withdrawalRequest.user_id)
-      .single();
-
-    if (walletError || !wallet) {
-      console.error('❌ Could not find wallet for user:', withdrawalRequest.user_id);
-      return;
-    }
-
-    // Update withdrawal status to completed (earnings already deducted)
-    const { error: updateError } = await supabase
+    await supabase
       .from('withdrawal_requests')
-      .update({
-        status: 'completed',
-        processed_at: new Date().toISOString()
-      })
+      .update({ status: 'completed', processed_at: new Date().toISOString() })
       .eq('id', withdrawalRequest.id);
 
-    if (updateError) {
-      console.error('❌ Failed to update withdrawal request:', updateError);
-      return;
-    }
-
-    // Update transaction record to show completion
-    const { error: transactionError } = await supabase
+    await supabase
       .from('transactions')
-      .update({
-        description: `Withdrawal completed: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})`
-      })
+      .update({ description: `Withdrawal completed: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})` })
       .eq('from_user_id', withdrawalRequest.user_id)
       .eq('amount', -withdrawalRequest.amount)
       .eq('transaction_type', 'withdrawal');
-
-    if (transactionError) {
-      console.error('❌ Failed to create transaction record:', transactionError);
-    }
-
-    console.log(`✅ Transfer completed successfully: $${withdrawalRequest.amount} for user ${withdrawalRequest.user_id}`);
   } catch (error) {
-    console.error('❌ Error handling transfer.paid:', error);
+    console.error('Error handling transfer.paid:', error);
   }
 }
 
 async function handleTransferFailed(transfer) {
   try {
-    console.log(`🔄 Processing transfer.failed for: ${transfer.id}`);
-    
-    // Find the withdrawal request by transfer ID
     const { data: withdrawalRequest, error: findError } = await supabase
       .from('withdrawal_requests')
       .select('*')
       .eq('stripe_transfer_id', transfer.id)
       .single();
 
-    if (findError || !withdrawalRequest) {
-      console.error('❌ Could not find withdrawal request for transfer:', transfer.id);
-      return;
-    }
+    if (findError || !withdrawalRequest) return;
 
-    console.log(`📋 Found failed withdrawal request: ${withdrawalRequest.id} for user: ${withdrawalRequest.user_id}`);
-
-    // Get user's current earnings to refund the amount
-    const { data: wallet, error: walletError } = await supabase
+    const { data: wallet } = await supabase
       .from('wallets')
       .select('earnings')
       .eq('user_id', withdrawalRequest.user_id)
       .single();
 
-    if (walletError || !wallet) {
-      console.error('❌ Could not find wallet for refund:', withdrawalRequest.user_id);
-      return;
+    if (wallet) {
+      await supabase
+        .from('wallets')
+        .update({ earnings: wallet.earnings + withdrawalRequest.amount })
+        .eq('user_id', withdrawalRequest.user_id);
     }
 
-    // Refund the withdrawal amount back to earnings
-    const refundedEarnings = wallet.earnings + withdrawalRequest.amount;
-    const { error: refundError } = await supabase
-      .from('wallets')
-      .update({ earnings: refundedEarnings })
-      .eq('user_id', withdrawalRequest.user_id);
-
-    if (refundError) {
-      console.error('❌ Failed to refund earnings:', refundError);
-      return;
-    }
-
-    // Update withdrawal status to failed
-    const { error: updateError } = await supabase
+    await supabase
       .from('withdrawal_requests')
       .update({
         status: 'failed',
         failure_reason: transfer.failure_message || 'Transfer failed',
-        processed_at: new Date().toISOString()
+        processed_at: new Date().toISOString(),
       })
       .eq('id', withdrawalRequest.id);
-
-    if (updateError) {
-      console.error('❌ Failed to update withdrawal request:', updateError);
-      return;
-    }
-
-    // Update transaction record to show refund
-    const { error: transactionError } = await supabase
-      .from('transactions')
-      .update({
-        description: `Withdrawal failed - refunded: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})`
-      })
-      .eq('from_user_id', withdrawalRequest.user_id)
-      .eq('amount', -withdrawalRequest.amount)
-      .eq('transaction_type', 'withdrawal');
-
-    if (transactionError) {
-      console.error('❌ Failed to update transaction record:', transactionError);
-    }
-
-    console.log(`✅ Transfer failure handled: ${withdrawalRequest.id}, $${withdrawalRequest.amount} refunded to earnings`);
   } catch (error) {
-    console.error('❌ Error handling transfer.failed:', error);
+    console.error('Error handling transfer.failed:', error);
   }
 }
 
-// Webhook endpoint for Stripe events (for production security)
-app.post('/webhook', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+// ============================================================
+// Twilio room creation + recording webhook
+// ============================================================
 
-  if (!webhookSecret) {
-    console.warn('⚠️ Webhook secret not configured - skipping verification');
-    return res.status(200).json({ received: true });
-  }
+async function userHasActiveRecordingSubscription(userId) {
+  const { data } = await supabase
+    .from('subscriptions')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('product', 'call_recording')
+    .in('status', ['active', 'trialing'])
+    .limit(1)
+    .maybeSingle();
+  return !!data;
+}
 
-  let event;
-
+app.post('/twilio/create-room', verifyToken, async (req, res) => {
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-    console.log(`📥 Webhook received: ${event.type}`);
-  } catch (err) {
-    console.error('❌ Webhook signature verification failed:', err.message);
-    return res.status(400).json({ error: 'Invalid webhook signature' });
-  }
+    const { callId } = req.body;
+    if (!callId) return res.status(400).json({ error: 'callId required' });
 
-  // Handle important events
-  switch (event.type) {
-    case 'payment_intent.succeeded':
-      const paymentIntent = event.data.object;
-      console.log(`✅ Payment succeeded via webhook: ${paymentIntent.id}`);
-      // Additional verification/logging can be added here
-      break;
-    case 'payment_intent.payment_failed':
-      const failedPayment = event.data.object;
-      console.log(`❌ Payment failed via webhook: ${failedPayment.id}`);
-      break;
-    case 'payment_intent.requires_action':
-      const actionRequired = event.data.object;
-      console.log(`⚠️ Payment requires action: ${actionRequired.id}`);
-      break;
-    case 'transfer.created':
-      const transfer = event.data.object;
-      console.log(`🔄 Transfer created via webhook: ${transfer.id}`);
-      // Transfer initiated, but not yet completed
-      break;
-    case 'transfer.updated':
-      const updatedTransfer = event.data.object;
-      console.log(`🔄 Transfer updated via webhook: ${updatedTransfer.id}, status: ${updatedTransfer.status}`);
-      if (updatedTransfer.status === 'paid') {
-        await handleTransferPaid(updatedTransfer);
-      } else if (updatedTransfer.status === 'failed') {
-        await handleTransferFailed(updatedTransfer);
+    const { data: callRow } = await supabase
+      .from('calls')
+      .select('id, caller_id, receiver_id, recording_enabled, twilio_room_sid')
+      .eq('id', callId)
+      .single();
+    if (!callRow) return res.status(404).json({ error: 'call not found' });
+    if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
+      return res.status(403).json({ error: 'not a call participant' });
+    }
+
+    const candidates = [callRow.caller_id, callRow.receiver_id];
+    let subscriberId = null;
+    if (await userHasActiveRecordingSubscription(req.user.id)) {
+      subscriberId = req.user.id;
+    } else {
+      for (const uid of candidates) {
+        if (uid === req.user.id) continue;
+        if (await userHasActiveRecordingSubscription(uid)) {
+          subscriberId = uid;
+          break;
+        }
       }
-      break;
-    case 'payout.paid':
-      const payout = event.data.object;
-      console.log(`✅ Payout paid via webhook: ${payout.id}`);
-      // This might be when money actually hits the bank
-      break;
-    case 'payout.failed':
-      const failedPayout = event.data.object;
-      console.log(`❌ Payout failed via webhook: ${failedPayout.id}`);
-      break;
-    default:
-      console.log(`ℹ️ Unhandled webhook event: ${event.type}`);
+    }
+
+    if (!subscriberId) return res.json({ recording: false, roomCreated: false });
+
+    const roomName = `call-${callId}`;
+    let room;
+    try {
+      room = await twilioClient.video.v1.rooms(roomName).fetch();
+    } catch (_) {
+      room = null;
+    }
+
+    if (!room || room.status === 'completed') {
+      const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
+      room = await twilioClient.video.v1.rooms.create({
+        uniqueName: roomName,
+        type: 'group',
+        recordParticipantsOnConnect: true,
+        statusCallback: callbackUrl || undefined,
+        statusCallbackMethod: 'POST',
+      });
+    }
+
+    if (!callRow.recording_enabled) {
+      await supabase
+        .from('calls')
+        .update({ recording_enabled: true, recording_subscriber_id: subscriberId, twilio_room_sid: room.sid })
+        .eq('id', callId);
+    }
+
+    res.json({ recording: true, roomCreated: true, roomSid: room.sid });
+  } catch (error) {
+    console.error('create-room failed:', error);
+    res.status(500).json({ error: 'failed to create room' });
+  }
+});
+
+async function handleTwilioRecordingEvent(body) {
+  const event = body.StatusCallbackEvent;
+  const roomSid = body.RoomSid;
+  if (!roomSid) return;
+
+  if (event === 'room-ended') {
+    const { data: callRow } = await supabase
+      .from('calls')
+      .select('id, recording_subscriber_id, call_type')
+      .eq('twilio_room_sid', roomSid)
+      .maybeSingle();
+    if (!callRow || !callRow.recording_subscriber_id) return;
+
+    const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
+
+    const composition = await twilioClient.video.v1.compositions.create({
+      roomSid,
+      audioSources: ['*'],
+      videoLayout:
+        callRow.call_type === 'video' ? { grid: { video_sources: ['*'] } } : undefined,
+      format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
+      statusCallback: callbackUrl || undefined,
+      statusCallbackMethod: 'POST',
+    });
+
+    await supabase.from('call_recordings').insert({
+      call_id: callRow.id,
+      subscriber_user_id: callRow.recording_subscriber_id,
+      twilio_composition_sid: composition.sid,
+      storage_path: '',
+      media_format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
+      call_type: callRow.call_type,
+      status: 'processing',
+    });
+    return;
   }
 
-  res.json({ received: true });
+  if (event === 'composition-available') {
+    const compositionSid = body.CompositionSid;
+    if (!compositionSid) return;
+
+    const { data: rec } = await supabase
+      .from('call_recordings')
+      .select('id, subscriber_user_id, call_id, media_format')
+      .eq('twilio_composition_sid', compositionSid)
+      .maybeSingle();
+    if (!rec) return;
+
+    const composition = await twilioClient.video.v1.compositions(compositionSid).fetch();
+    const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
+
+    const mediaResp = await fetch(mediaUrl, {
+      headers: {
+        Authorization:
+          'Basic ' +
+          Buffer.from(`${process.env.TWILIO_API_KEY}:${process.env.TWILIO_API_SECRET}`).toString('base64'),
+      },
+      redirect: 'follow',
+    });
+    if (!mediaResp.ok) {
+      console.error('Failed to fetch composition media:', mediaResp.status);
+      return;
+    }
+    const buffer = await mediaResp.buffer();
+
+    const ext = rec.media_format;
+    const path = `${rec.subscriber_user_id}/${rec.call_id}.${ext}`;
+    const { error: uploadErr } = await supabase.storage
+      .from('recordings')
+      .upload(path, buffer, {
+        contentType: ext === 'mp4' ? 'video/mp4' : 'audio/mpeg',
+        upsert: true,
+      });
+    if (uploadErr) {
+      console.error('Failed to upload recording to storage:', uploadErr);
+      return;
+    }
+
+    await supabase
+      .from('call_recordings')
+      .update({
+        storage_path: path,
+        size_bytes: buffer.length,
+        duration_seconds: composition.duration || null,
+        status: 'ready',
+      })
+      .eq('id', rec.id);
+
+    try {
+      await twilioClient.video.v1.compositions(compositionSid).remove();
+    } catch (e) {
+      console.warn('Failed to remove composition:', e.message);
+    }
+  }
+}
+
+// Signed download URL for a recording (subscriber-only)
+app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
+  try {
+    const { data: rec } = await supabase
+      .from('call_recordings')
+      .select('id, subscriber_user_id, storage_path, status')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (!rec) return res.status(404).json({ error: 'not found' });
+    if (rec.subscriber_user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' });
+    if (rec.status !== 'ready' || !rec.storage_path) {
+      return res.status(409).json({ error: 'recording not ready' });
+    }
+
+    const { data, error } = await supabase.storage
+      .from('recordings')
+      .createSignedUrl(rec.storage_path, 60 * 10);
+    if (error) throw error;
+
+    res.json({ url: data.signedUrl });
+  } catch (error) {
+    console.error('signed-url failed:', error);
+    res.status(500).json({ error: 'failed to sign url' });
+  }
 });
 
 // 404 handler
@@ -642,51 +912,45 @@ app.use('*', (req, res) => {
       'GET /',
       'GET /health',
       'GET /stripe/balance',
+      'GET /recordings/:id/signed-url',
       'POST /create-payment-intent',
       'POST /stripe/create-express-account',
       'POST /stripe/create-account-link',
       'POST /stripe/account-status',
       'POST /stripe/process-withdrawal',
-      'POST /webhook'
-    ]
+      'POST /stripe/create-subscription-checkout',
+      'POST /stripe/cancel-subscription',
+      'POST /stripe/webhook',
+      'POST /webhook',
+      'POST /twilio/create-room',
+      'POST /twilio/recording-webhook',
+    ],
   });
 });
 
-// Global error handler
 app.use((error, req, res, next) => {
-  console.error('❌ Server error:', error);
-  res.status(500).json({ 
+  console.error('Server error:', error);
+  res.status(500).json({
     error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong',
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🔄 Received SIGTERM, shutting down gracefully...');
-  process.exit(0);
-});
+process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down gracefully'); process.exit(0); });
+process.on('SIGINT', () => { console.log('SIGINT received, shutting down gracefully'); process.exit(0); });
 
-process.on('SIGINT', () => {
-  console.log('🔄 Received SIGINT, shutting down gracefully...');
-  process.exit(0);
-});
-
-// Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 TalkProfit Payment Server running on port ${PORT}`);
-  console.log(`📋 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔑 Stripe configured: ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌'}`);
-  console.log(`🎯 CORS origins: ${corsOptions.origin.length} configured`);
+  console.log(`TalkProfit Payment Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Stripe configured: ${process.env.STRIPE_SECRET_KEY ? 'yes' : 'no'}`);
+  console.log(`Twilio configured: ${process.env.TWILIO_API_KEY ? 'yes' : 'no'}`);
 });
 
-// Handle server errors
 server.on('error', (error) => {
   if (error.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} is already in use`);
+    console.error(`Port ${PORT} is already in use`);
     process.exit(1);
   } else {
-    console.error('❌ Server error:', error);
     throw error;
   }
 });
