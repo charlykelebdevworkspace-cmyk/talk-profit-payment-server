@@ -28,6 +28,7 @@ const twilioClient = twilio(
 
 const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const STRIPE_WEBHOOK_SECRET_RECORDING = process.env.STRIPE_WEBHOOK_SECRET_RECORDING;
 
 app.set('trust proxy', 1);
 
@@ -113,6 +114,37 @@ app.post(
       res.json({ received: true });
     } catch (err) {
       console.error('Stripe webhook handler error:', err);
+      res.status(500).json({ error: 'webhook handler failed' });
+    }
+  }
+);
+
+app.post(
+  '/stripe/webhook/recording',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!STRIPE_WEBHOOK_SECRET_RECORDING) {
+      console.error('STRIPE_WEBHOOK_SECRET_RECORDING not configured');
+      return res.status(500).send('Webhook secret not configured');
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers['stripe-signature'],
+        STRIPE_WEBHOOK_SECRET_RECORDING
+      );
+    } catch (err) {
+      console.error('Stripe recording webhook signature failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      await handleRecordingSubscriptionEvent(event);
+      res.json({ received: true });
+    } catch (err) {
+      console.error('Stripe recording webhook handler error:', err);
       res.status(500).json({ error: 'webhook handler failed' });
     }
   }
@@ -615,6 +647,31 @@ async function handleStripeEvent(event) {
     case 'transfer.updated': {
       if (obj.status === 'paid') await handleTransferPaid(obj);
       else if (obj.status === 'failed') await handleTransferFailed(obj);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+async function handleRecordingSubscriptionEvent(event) {
+  const obj = event.data.object;
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      if (obj.mode !== 'subscription') return;
+      const userId = obj.metadata?.user_id;
+      if (!userId) return;
+      const subscription = await stripe.subscriptions.retrieve(obj.subscription);
+      await upsertSubscriptionRow(userId, subscription, obj.customer);
+      break;
+    }
+    case 'customer.subscription.created':
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted': {
+      const userId = obj.metadata?.user_id;
+      if (!userId) return;
+      await upsertSubscriptionRow(userId, obj, obj.customer);
       break;
     }
     default:
