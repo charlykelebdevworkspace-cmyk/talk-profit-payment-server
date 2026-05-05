@@ -779,19 +779,22 @@ async function userHasActiveRecordingSubscription(userId) {
       console.log('start-recording: callId=', callId, 'user=', req.user.id);
       if (!callId) return res.status(400).json({ error: 'callId required' });                                      
                                                                                                                    
-      const roomName = `call-${callId}`;                                                                         
-      let room;                                                                                                    
-      try {                                                                                                        
-        room = await twilioClient.video.v1.rooms(roomName).fetch();                                              
-      } catch (_) {                                                                                                
-        room = null;                                                                                               
-      }                                                                                                          
-                                                                                                                   
-      if (!room || room.status === 'completed') {           
-        const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;                  
-        room = await twilioClient.video.v1.rooms.create({                                                          
+      const roomName = `call-${callId}`;
+      let room;
+      try {
+        room = await twilioClient.video.v1.rooms(roomName).fetch();
+      } catch (e) {
+        if (e?.status && e.status !== 404) {
+          console.error('rooms.fetch failed:', e.status, e.code, e.message);
+        }
+        room = null;
+      }
+
+      if (!room || room.status === 'completed') {
+        const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
+        room = await twilioClient.video.v1.rooms.create({
           uniqueName: roomName,
-          type: 'group',                                                                                           
+          type: 'group',
           recordParticipantsOnConnect: true,                
           statusCallback: callbackUrl || undefined,                                                                
           statusCallbackMethod: 'POST',                     
@@ -858,10 +861,13 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
 
       const roomName = `call-${callId}`;                                                                           
       let room;
-      try {                                                                                                        
+      try {
         room = await twilioClient.video.v1.rooms(roomName).fetch();
-      } catch (_) {                                                                                                
-        room = null;                                                                                               
+      } catch (e) {
+        if (e?.status && e.status !== 404) {
+          console.error('rooms.fetch failed:', e.status, e.code, e.message);
+        }
+        room = null;
       }                                                                                                            
                                                                                                                    
       if (!room || room.status === 'completed') {                                                                
