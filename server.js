@@ -837,11 +837,15 @@ async function userHasActiveRecordingSubscription(userId) {
       // Only set recording_subscriber_id if it isn't already set (first caller wins).
       // Otherwise a non-subscriber calling /start-recording second would overwrite the real subscriber.
       try {
-        const { data: existingCall } = await supabase
+        const { data: existingCall, error: lookupErr } = await supabase
           .from('calls')
-          .select('recording_subscriber_id')
+          .select('id, recording_subscriber_id, twilio_room_sid')
           .eq('id', callId)
           .maybeSingle();
+        if (lookupErr) console.warn('[start-recording] calls lookup error:', lookupErr.message);
+        if (!existingCall) {
+          console.warn('[start-recording] no calls row found for callId=%s — recording WILL still happen but room-ended webhook will not find this call. Make sure the call row is inserted before /start-recording.', callId);
+        }
 
         const update = {
           recording_enabled: true,
@@ -850,8 +854,13 @@ async function userHasActiveRecordingSubscription(userId) {
         if (!existingCall?.recording_subscriber_id) {
           update.recording_subscriber_id = req.user.id;
         }
-        const { error: updErr } = await supabase.from('calls').update(update).eq('id', callId);
+        const { data: updated, error: updErr } = await supabase
+          .from('calls')
+          .update(update)
+          .eq('id', callId)
+          .select('id, twilio_room_sid, recording_subscriber_id');
         if (updErr) console.warn('[start-recording] calls update error:', updErr.message);
+        else console.log('[start-recording] calls update matched=%d row=%j', updated?.length || 0, updated?.[0] || null);
       } catch (e) {
         console.warn('[start-recording] calls update skipped:', e?.message);
       }
@@ -991,15 +1000,32 @@ async function handleTwilioRecordingEvent(body) {
   }
 
   if (event === 'room-ended') {
-    console.log('[recording-event] room-ended roomSid=%s — looking up call', roomSid);
-    const { data: callRow, error: callErr } = await supabase
+    const roomName = body.RoomName || '';
+    console.log('[recording-event] room-ended roomSid=%s roomName=%s — looking up call', roomSid, roomName);
+
+    // Primary lookup: by stored twilio_room_sid
+    let { data: callRow, error: callErr } = await supabase
       .from('calls')
       .select('id, recording_subscriber_id, call_type')
       .eq('twilio_room_sid', roomSid)
       .maybeSingle();
-    if (callErr) console.error('[recording-event] calls lookup error:', callErr.message);
+    if (callErr) console.error('[recording-event] calls lookup-by-sid error:', callErr.message);
+
+    // Fallback: derive callId from roomName (we always create rooms as `call-<callId>`)
+    if (!callRow && roomName.startsWith('call-')) {
+      const derivedCallId = roomName.slice('call-'.length);
+      console.log('[recording-event] sid lookup failed, retrying by callId=%s parsed from roomName', derivedCallId);
+      const { data: byId, error: byIdErr } = await supabase
+        .from('calls')
+        .select('id, recording_subscriber_id, call_type')
+        .eq('id', derivedCallId)
+        .maybeSingle();
+      if (byIdErr) console.error('[recording-event] calls lookup-by-id error:', byIdErr.message);
+      callRow = byId || null;
+    }
+
     if (!callRow) {
-      console.warn('[recording-event] no call row for roomSid=%s — skipping', roomSid);
+      console.warn('[recording-event] no call row found for roomSid=%s roomName=%s — skipping', roomSid, roomName);
       return;
     }
     if (!callRow.recording_subscriber_id) {
