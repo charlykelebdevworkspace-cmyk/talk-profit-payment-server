@@ -818,6 +818,8 @@ async function userHasActiveRecordingSubscription(userId) {
           recordParticipantsOnConnect: true,
           statusCallback: callbackUrl || undefined,
           statusCallbackMethod: callbackUrl ? 'POST' : undefined,
+          emptyRoomTimeout: 1,
+          unusedRoomTimeout: 1,
         });
         console.log('[start-recording] created group room sid=%s callback=%s', room.sid, callbackUrl || '(none)');
       } else if (room.type !== 'group') {
@@ -832,16 +834,23 @@ async function userHasActiveRecordingSubscription(userId) {
         console.log('[start-recording] updated recordingRules sid=%s — note: only participants who (re)connect after this point will be recorded', room.sid);
       }
 
-      // Best-effort DB update — won't fail the request if the row is missing
+      // Only set recording_subscriber_id if it isn't already set (first caller wins).
+      // Otherwise a non-subscriber calling /start-recording second would overwrite the real subscriber.
       try {
-        const { error: updErr } = await supabase
+        const { data: existingCall } = await supabase
           .from('calls')
-          .update({
-            recording_enabled: true,
-            recording_subscriber_id: req.user.id,
-            twilio_room_sid: room.sid,
-          })
-          .eq('id', callId);
+          .select('recording_subscriber_id')
+          .eq('id', callId)
+          .maybeSingle();
+
+        const update = {
+          recording_enabled: true,
+          twilio_room_sid: room.sid,
+        };
+        if (!existingCall?.recording_subscriber_id) {
+          update.recording_subscriber_id = req.user.id;
+        }
+        const { error: updErr } = await supabase.from('calls').update(update).eq('id', callId);
         if (updErr) console.warn('[start-recording] calls update error:', updErr.message);
       } catch (e) {
         console.warn('[start-recording] calls update skipped:', e?.message);
@@ -907,6 +916,8 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
           recordParticipantsOnConnect: !!subscriberId,
           statusCallback: callbackUrl || undefined,
           statusCallbackMethod: callbackUrl ? 'POST' : undefined,
+          emptyRoomTimeout: 1,
+          unusedRoomTimeout: 1,
         });
         console.log('[create-room] created group room sid=%s record=%s callback=%s',
           room.sid, !!subscriberId, callbackUrl || '(none)');
@@ -925,8 +936,51 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
     } catch (error) {
       console.error('[create-room] failed:', error);
       res.status(500).json({ error: 'failed to create room' });
-    }                                                                                                            
-  });     
+    }
+  });
+
+// Explicitly complete a room when the call hangs up — fires room-ended immediately
+// instead of waiting for Twilio's emptyRoomTimeout.
+app.post('/twilio/end-room', verifyToken, async (req, res) => {
+  try {
+    const { callId } = req.body;
+    if (!callId) return res.status(400).json({ error: 'callId required' });
+    console.log('[end-room] callId=%s user=%s', callId, req.user.id);
+
+    const { data: callRow } = await supabase
+      .from('calls')
+      .select('id, caller_id, receiver_id, twilio_room_sid')
+      .eq('id', callId)
+      .maybeSingle();
+    if (!callRow) return res.status(404).json({ error: 'call not found' });
+    if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
+      return res.status(403).json({ error: 'not a call participant' });
+    }
+    if (!callRow.twilio_room_sid) {
+      console.log('[end-room] no twilio_room_sid on callId=%s — nothing to end', callId);
+      return res.json({ ended: false, reason: 'no room' });
+    }
+
+    try {
+      const updated = await twilioClient.video.v1
+        .rooms(callRow.twilio_room_sid)
+        .update({ status: 'completed' });
+      console.log('[end-room] completed room sid=%s status=%s', updated.sid, updated.status);
+      res.json({ ended: true, roomSid: updated.sid });
+    } catch (e) {
+      // Already completed is fine
+      if (e?.status === 400 || /already.*completed/i.test(e?.message || '')) {
+        console.log('[end-room] room already completed sid=%s', callRow.twilio_room_sid);
+        return res.json({ ended: true, alreadyCompleted: true });
+      }
+      console.error('[end-room] failed to complete room:', e?.status, e?.code, e?.message);
+      res.status(500).json({ error: e?.message || 'failed to end room' });
+    }
+  } catch (error) {
+    console.error('[end-room] failed:', error);
+    res.status(500).json({ error: error.message || 'failed to end room' });
+  }
+});
 
 async function handleTwilioRecordingEvent(body) {
   const event = body.StatusCallbackEvent;
@@ -1116,6 +1170,8 @@ app.use('*', (req, res) => {
       'POST /stripe/webhook',
       'POST /webhook',
       'POST /twilio/create-room',
+      'POST /twilio/start-recording',
+      'POST /twilio/end-room',
       'POST /twilio/recording-webhook',
     ],
   });
