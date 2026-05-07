@@ -30,6 +30,16 @@ const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const STRIPE_WEBHOOK_SECRET_RECORDING = process.env.STRIPE_WEBHOOK_SECRET_RECORDING;
 
+function getRecordingCallbackUrl() {
+  const base = process.env.PUBLIC_BACKEND_URL;
+  if (!base) return null;
+  if (!/^https?:\/\//i.test(base)) {
+    console.error('PUBLIC_BACKEND_URL must be an absolute http(s) URL, got:', base);
+    return null;
+  }
+  return `${base.replace(/\/$/, '')}/twilio/recording-webhook`;
+}
+
 app.set('trust proxy', 1);
 
 app.use(helmet());
@@ -179,11 +189,15 @@ app.post(
   '/twilio/recording-webhook',
   express.urlencoded({ extended: false }),
   async (req, res) => {
+    console.log('[twilio-webhook] received event=%s roomSid=%s compositionSid=%s',
+      req.body?.StatusCallbackEvent,
+      req.body?.RoomSid,
+      req.body?.CompositionSid);
     try {
       await handleTwilioRecordingEvent(req.body);
       res.status(200).send('ok');
     } catch (err) {
-      console.error('Twilio recording webhook error:', err);
+      console.error('[twilio-webhook] handler error:', err);
       res.status(500).send('error');
     }
   }
@@ -773,61 +787,71 @@ async function userHasActiveRecordingSubscription(userId) {
     .maybeSingle();
   return !!data;
 }
-  app.post('/twilio/start-recording', verifyToken, async (req, res) => {                                           
+  app.post('/twilio/start-recording', verifyToken, async (req, res) => {
     try {
-      const { callId } = req.body;                                                                                 
-      console.log('start-recording: callId=', callId, 'user=', req.user.id);
-      if (!callId) return res.status(400).json({ error: 'callId required' });                                      
-                                                                                                                   
+      const { callId } = req.body;
+      console.log('[start-recording] callId=%s user=%s', callId, req.user.id);
+      if (!callId) return res.status(400).json({ error: 'callId required' });
+
       const roomName = `call-${callId}`;
+      const callbackUrl = getRecordingCallbackUrl();
+      if (!callbackUrl) {
+        console.warn('[start-recording] PUBLIC_BACKEND_URL not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
+      }
+
       let room;
       try {
         room = await twilioClient.video.v1.rooms(roomName).fetch();
+        console.log('[start-recording] existing room sid=%s status=%s type=%s', room.sid, room.status, room.type);
       } catch (e) {
         if (e?.status && e.status !== 404) {
-          console.error('rooms.fetch failed:', e.status, e.code, e.message);
+          console.error('[start-recording] rooms.fetch failed:', e.status, e.code, e.message);
         }
         room = null;
       }
 
+      let recordingMode = 'created'; // 'created' | 'rules-updated'
       if (!room || room.status === 'completed') {
-        const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
         room = await twilioClient.video.v1.rooms.create({
           uniqueName: roomName,
           type: 'group',
-          recordParticipantsOnConnect: true,                
-          statusCallback: callbackUrl || undefined,                                                                
-          statusCallbackMethod: 'POST',                     
-        });                                                                                                        
-      } else if (room.type !== 'group') {                   
-        return res.status(409).json({                                                                              
-          error: 'Room is peer-to-peer. End the call and start a new one to enable recording.',                    
-        });                                                                                                        
-      } else {                                                                                                     
-        await twilioClient.video.v1.rooms(room.sid).recordingRules.update({                                        
-          rules: [{ type: 'include', all: true }],                                                                 
-        });                                                                                                        
-      }                                                                                                            
-                                                                                                                   
-      // Best-effort DB update — won't fail the request if the row is missing                                      
-      try {                                                                                                      
-        await supabase                                                                                             
-          .from('calls')                                    
-          .update({                                                                                                
+          recordParticipantsOnConnect: true,
+          statusCallback: callbackUrl || undefined,
+          statusCallbackMethod: callbackUrl ? 'POST' : undefined,
+        });
+        console.log('[start-recording] created group room sid=%s callback=%s', room.sid, callbackUrl || '(none)');
+      } else if (room.type !== 'group') {
+        return res.status(409).json({
+          error: 'Room is peer-to-peer. End the call and start a new one to enable recording.',
+        });
+      } else {
+        await twilioClient.video.v1.rooms(room.sid).recordingRules.update({
+          rules: [{ type: 'include', all: true }],
+        });
+        recordingMode = 'rules-updated';
+        console.log('[start-recording] updated recordingRules sid=%s — note: only participants who (re)connect after this point will be recorded', room.sid);
+      }
+
+      // Best-effort DB update — won't fail the request if the row is missing
+      try {
+        const { error: updErr } = await supabase
+          .from('calls')
+          .update({
             recording_enabled: true,
-            recording_subscriber_id: req.user.id,                                                                  
-            twilio_room_sid: room.sid,                      
-          })                                                                                                       
+            recording_subscriber_id: req.user.id,
+            twilio_room_sid: room.sid,
+          })
           .eq('id', callId);
-      } catch (e) {                                                                                                
-        console.warn('calls update skipped:', e?.message);  
-      }                                                                                                            
-   
-      res.json({ recording: true, roomSid: room.sid });                                                            
-    } catch (error) {                                       
-      console.error('start-recording failed:', error);                                                             
+        if (updErr) console.warn('[start-recording] calls update error:', updErr.message);
+      } catch (e) {
+        console.warn('[start-recording] calls update skipped:', e?.message);
+      }
+
+      res.json({ recording: true, roomSid: room.sid, mode: recordingMode });
+    } catch (error) {
+      console.error('[start-recording] failed:', error);
       res.status(500).json({ error: error.message || 'failed to start recording' });
-    }                                                                                                              
+    }
   });
 
 app.post('/twilio/create-room', verifyToken, async (req, res) => {                                               
@@ -859,91 +883,137 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
         }                                                   
       }                                                                                                          
 
-      const roomName = `call-${callId}`;                                                                           
+      const roomName = `call-${callId}`;
+      const callbackUrl = getRecordingCallbackUrl();
+      if (subscriberId && !callbackUrl) {
+        console.warn('[create-room] PUBLIC_BACKEND_URL not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
+      }
+
       let room;
       try {
         room = await twilioClient.video.v1.rooms(roomName).fetch();
+        console.log('[create-room] existing room sid=%s status=%s type=%s', room.sid, room.status, room.type);
       } catch (e) {
         if (e?.status && e.status !== 404) {
-          console.error('rooms.fetch failed:', e.status, e.code, e.message);
+          console.error('[create-room] rooms.fetch failed:', e.status, e.code, e.message);
         }
         room = null;
-      }                                                                                                            
-                                                                                                                   
-      if (!room || room.status === 'completed') {                                                                
-        const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;                  
-        room = await twilioClient.video.v1.rooms.create({                                                          
+      }
+
+      if (!room || room.status === 'completed') {
+        room = await twilioClient.video.v1.rooms.create({
           uniqueName: roomName,
-          type: 'group',                                                                                           
-          recordParticipantsOnConnect: !!subscriberId,      
-          statusCallback: callbackUrl || undefined,                                                                
-          statusCallbackMethod: 'POST',                     
-        });                                                                                                        
-      }                                                     
-                                                                                                                 
-      if (subscriberId && !callRow.recording_enabled) {                                                            
+          type: 'group',
+          recordParticipantsOnConnect: !!subscriberId,
+          statusCallback: callbackUrl || undefined,
+          statusCallbackMethod: callbackUrl ? 'POST' : undefined,
+        });
+        console.log('[create-room] created group room sid=%s record=%s callback=%s',
+          room.sid, !!subscriberId, callbackUrl || '(none)');
+      }
+
+      if (subscriberId && !callRow.recording_enabled) {
         await supabase
-          .from('calls')                                                                                           
+          .from('calls')
           .update({ recording_enabled: true, recording_subscriber_id: subscriberId, twilio_room_sid: room.sid })
-          .eq('id', callId);                                                                                       
+          .eq('id', callId);
       } else if (!callRow.twilio_room_sid) {
-        await supabase.from('calls').update({ twilio_room_sid: room.sid }).eq('id', callId);                       
-      }                                                                                                            
-                                                                                                                   
-      res.json({ recording: !!subscriberId, roomCreated: true, roomSid: room.sid });                               
-    } catch (error) {                                                                                            
-      console.error('create-room failed:', error);                                                                 
-      res.status(500).json({ error: 'failed to create room' });                                                    
+        await supabase.from('calls').update({ twilio_room_sid: room.sid }).eq('id', callId);
+      }
+
+      res.json({ recording: !!subscriberId, roomCreated: true, roomSid: room.sid });
+    } catch (error) {
+      console.error('[create-room] failed:', error);
+      res.status(500).json({ error: 'failed to create room' });
     }                                                                                                            
   });     
 
 async function handleTwilioRecordingEvent(body) {
   const event = body.StatusCallbackEvent;
   const roomSid = body.RoomSid;
-  if (!roomSid) return;
+  if (!roomSid && !body.CompositionSid) {
+    console.warn('[recording-event] no RoomSid/CompositionSid in payload, ignoring');
+    return;
+  }
 
   if (event === 'room-ended') {
-    const { data: callRow } = await supabase
+    console.log('[recording-event] room-ended roomSid=%s — looking up call', roomSid);
+    const { data: callRow, error: callErr } = await supabase
       .from('calls')
       .select('id, recording_subscriber_id, call_type')
       .eq('twilio_room_sid', roomSid)
       .maybeSingle();
-    if (!callRow || !callRow.recording_subscriber_id) return;
+    if (callErr) console.error('[recording-event] calls lookup error:', callErr.message);
+    if (!callRow) {
+      console.warn('[recording-event] no call row for roomSid=%s — skipping', roomSid);
+      return;
+    }
+    if (!callRow.recording_subscriber_id) {
+      console.log('[recording-event] callId=%s has no recording_subscriber_id — skipping composition', callRow.id);
+      return;
+    }
 
-    const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
+    const callbackUrl = getRecordingCallbackUrl();
+    const format = callRow.call_type === 'video' ? 'mp4' : 'mp3';
+    console.log('[recording-event] creating composition callId=%s format=%s callback=%s',
+      callRow.id, format, callbackUrl || '(none)');
 
-    const composition = await twilioClient.video.v1.compositions.create({
-      roomSid,
-      audioSources: ['*'],
-      videoLayout:
-        callRow.call_type === 'video' ? { grid: { video_sources: ['*'] } } : undefined,
-      format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
-      statusCallback: callbackUrl || undefined,
-      statusCallbackMethod: 'POST',
-    });
+    let composition;
+    try {
+      composition = await twilioClient.video.v1.compositions.create({
+        roomSid,
+        audioSources: ['*'],
+        videoLayout:
+          callRow.call_type === 'video' ? { grid: { video_sources: ['*'] } } : undefined,
+        format,
+        statusCallback: callbackUrl || undefined,
+        statusCallbackMethod: callbackUrl ? 'POST' : undefined,
+      });
+      console.log('[recording-event] composition created sid=%s status=%s', composition.sid, composition.status);
+    } catch (e) {
+      console.error('[recording-event] composition create failed:', e?.status, e?.code, e?.message);
+      await supabase.from('call_recordings').insert({
+        call_id: callRow.id,
+        subscriber_user_id: callRow.recording_subscriber_id,
+        twilio_composition_sid: null,
+        storage_path: '',
+        media_format: format,
+        call_type: callRow.call_type,
+        status: 'failed',
+      });
+      return;
+    }
 
-    await supabase.from('call_recordings').insert({
+    const { error: insErr } = await supabase.from('call_recordings').insert({
       call_id: callRow.id,
       subscriber_user_id: callRow.recording_subscriber_id,
       twilio_composition_sid: composition.sid,
       storage_path: '',
-      media_format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
+      media_format: format,
       call_type: callRow.call_type,
       status: 'processing',
     });
+    if (insErr) console.error('[recording-event] call_recordings insert error:', insErr.message);
     return;
   }
 
   if (event === 'composition-available') {
     const compositionSid = body.CompositionSid;
-    if (!compositionSid) return;
+    if (!compositionSid) {
+      console.warn('[recording-event] composition-available with no CompositionSid');
+      return;
+    }
+    console.log('[recording-event] composition-available sid=%s', compositionSid);
 
     const { data: rec } = await supabase
       .from('call_recordings')
       .select('id, subscriber_user_id, call_id, media_format')
       .eq('twilio_composition_sid', compositionSid)
       .maybeSingle();
-    if (!rec) return;
+    if (!rec) {
+      console.warn('[recording-event] no call_recordings row for composition=%s', compositionSid);
+      return;
+    }
 
     const composition = await twilioClient.video.v1.compositions(compositionSid).fetch();
     const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
@@ -957,10 +1027,12 @@ async function handleTwilioRecordingEvent(body) {
       redirect: 'follow',
     });
     if (!mediaResp.ok) {
-      console.error('Failed to fetch composition media:', mediaResp.status);
+      console.error('[recording-event] fetch composition media failed:', mediaResp.status, mediaResp.statusText);
+      await supabase.from('call_recordings').update({ status: 'failed' }).eq('id', rec.id);
       return;
     }
     const buffer = await mediaResp.buffer();
+    console.log('[recording-event] downloaded media bytes=%d composition=%s', buffer.length, compositionSid);
 
     const ext = rec.media_format;
     const path = `${rec.subscriber_user_id}/${rec.call_id}.${ext}`;
@@ -971,9 +1043,11 @@ async function handleTwilioRecordingEvent(body) {
         upsert: true,
       });
     if (uploadErr) {
-      console.error('Failed to upload recording to storage:', uploadErr);
+      console.error('[recording-event] storage upload failed:', uploadErr.message);
+      await supabase.from('call_recordings').update({ status: 'failed' }).eq('id', rec.id);
       return;
     }
+    console.log('[recording-event] uploaded to storage path=%s', path);
 
     await supabase
       .from('call_recordings')
@@ -988,9 +1062,12 @@ async function handleTwilioRecordingEvent(body) {
     try {
       await twilioClient.video.v1.compositions(compositionSid).remove();
     } catch (e) {
-      console.warn('Failed to remove composition:', e.message);
+      console.warn('[recording-event] failed to remove composition:', e.message);
     }
+    return;
   }
+
+  console.log('[recording-event] unhandled event=%s roomSid=%s', event, roomSid);
 }
 
 // Signed download URL for a recording (subscriber-only)
@@ -1060,6 +1137,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Stripe configured: ${process.env.STRIPE_SECRET_KEY ? 'yes' : 'no'}`);
   console.log(`Twilio configured: ${process.env.TWILIO_API_KEY ? 'yes' : 'no'}`);
+  const cb = getRecordingCallbackUrl();
+  if (cb) {
+    console.log(`Twilio recording callback: ${cb}`);
+  } else {
+    console.warn('Twilio recording callback: DISABLED — set PUBLIC_BACKEND_URL to a publicly reachable https URL (e.g. https://your-app.up.railway.app) or compositions will never be created.');
+  }
 });
 
 server.on('error', (error) => {
