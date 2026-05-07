@@ -20,6 +20,39 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Decode the JWT payload (no signature check — we just want to see `role`)
+function decodeJwtRole(jwt) {
+  try {
+    const payload = jwt.split('.')[1];
+    const json = Buffer.from(payload, 'base64').toString('utf8');
+    return JSON.parse(json).role || '(no role claim)';
+  } catch {
+    return '(unparseable)';
+  }
+}
+
+async function logSupabaseDiagnostic() {
+  const url = process.env.SUPABASE_URL || '';
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const projectRef = (url.match(/^https:\/\/([^.]+)\./) || [])[1] || '(none)';
+  const role = key ? decodeJwtRole(key) : '(missing)';
+  console.log(`Supabase URL: ${url || '(missing)'}  projectRef=${projectRef}  keyRole=${role}`);
+
+  if (role !== 'service_role') {
+    console.warn('SUPABASE_SERVICE_ROLE_KEY does NOT have role=service_role — RLS will hide rows from the backend. Use the service-role key from Supabase → Settings → API.');
+  }
+
+  try {
+    const { count, error } = await supabase
+      .from('calls')
+      .select('*', { count: 'exact', head: true });
+    if (error) console.error('[supabase-diag] calls count failed:', error.message);
+    else console.log(`[supabase-diag] calls table reachable, total rows=${count}`);
+  } catch (e) {
+    console.error('[supabase-diag] calls count threw:', e?.message);
+  }
+}
+
 const twilioClient = twilio(
   process.env.TWILIO_API_KEY,
   process.env.TWILIO_API_SECRET,
@@ -1225,6 +1258,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   } else {
     console.warn('Twilio recording callback: DISABLED — set PUBLIC_BACKEND_URL to a publicly reachable https URL (e.g. https://your-app.up.railway.app) or compositions will never be created.');
   }
+  logSupabaseDiagnostic();
 });
 
 server.on('error', (error) => {
