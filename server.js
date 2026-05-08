@@ -6,7 +6,6 @@ const dotenv = require('dotenv');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
-const fetch = require('node-fetch');
 
 dotenv.config();
 
@@ -15,12 +14,24 @@ const PORT = process.env.PORT || 3001;
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// "Admin" client — uses whatever key is in SUPABASE_SERVICE_ROLE_KEY.
+// On Lovable projects without service-role access this is actually the anon
+// key, so it can ONLY do auth.getUser() and call SECURITY DEFINER functions.
+// Database reads/writes for user-owned data go through userClient(jwt) below.
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '';
 
-// Decode the JWT payload (no signature check — we just want to see `role`)
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Per-request client authenticated as the calling user. Use this for any DB
+// access that should obey RLS. Built once per request inside verifyToken.
+function userClient(userJwt) {
+  return createClient(SUPABASE_URL, SUPABASE_KEY, {
+    global: { headers: { Authorization: `Bearer ${userJwt}` } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
 function decodeJwtRole(jwt) {
   try {
     const payload = jwt.split('.')[1];
@@ -32,24 +43,12 @@ function decodeJwtRole(jwt) {
 }
 
 async function logSupabaseDiagnostic() {
-  const url = process.env.SUPABASE_URL || '';
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-  const projectRef = (url.match(/^https:\/\/([^.]+)\./) || [])[1] || '(none)';
-  const role = key ? decodeJwtRole(key) : '(missing)';
-  console.log(`Supabase URL: ${url || '(missing)'}  projectRef=${projectRef}  keyRole=${role}`);
+  const projectRef = (SUPABASE_URL.match(/^https:\/\/([^.]+)\./) || [])[1] || '(none)';
+  const role = SUPABASE_KEY ? decodeJwtRole(SUPABASE_KEY) : '(missing)';
+  console.log(`Supabase URL: ${SUPABASE_URL || '(missing)'}  projectRef=${projectRef}  keyRole=${role}`);
 
   if (role !== 'service_role') {
-    console.warn('SUPABASE_SERVICE_ROLE_KEY does NOT have role=service_role — RLS will hide rows from the backend. Use the service-role key from Supabase → Settings → API.');
-  }
-
-  try {
-    const { count, error } = await supabase
-      .from('calls')
-      .select('*', { count: 'exact', head: true });
-    if (error) console.error('[supabase-diag] calls count failed:', error.message);
-    else console.log(`[supabase-diag] calls table reachable, total rows=${count}`);
-  } catch (e) {
-    console.error('[supabase-diag] calls count threw:', e?.message);
+    console.warn('Supabase key role is NOT service_role. Backend DB writes go through user JWTs (RLS) and the recording webhook is delegated to a Supabase Edge Function. Make sure the Edge Function "twilio-recording-webhook" is deployed.');
   }
 }
 
@@ -63,14 +62,21 @@ const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const STRIPE_WEBHOOK_SECRET_RECORDING = process.env.STRIPE_WEBHOOK_SECRET_RECORDING;
 
+// Twilio status callbacks (room-ended, composition-available) are delivered to a
+// Supabase Edge Function so DB/storage writes can run with the auto-injected
+// service-role key. WEBHOOK_KEY is a shared secret stored on Railway and as a
+// Supabase Edge Function secret — Twilio passes it through as ?key=...
 function getRecordingCallbackUrl() {
-  const base = process.env.PUBLIC_BACKEND_URL;
-  if (!base) return null;
-  if (!/^https?:\/\//i.test(base)) {
-    console.error('PUBLIC_BACKEND_URL must be an absolute http(s) URL, got:', base);
+  if (!SUPABASE_URL || !/^https:\/\//i.test(SUPABASE_URL)) {
+    console.error('SUPABASE_URL missing/invalid — cannot build Twilio recording callback URL');
     return null;
   }
-  return `${base.replace(/\/$/, '')}/twilio/recording-webhook`;
+  const key = process.env.WEBHOOK_KEY;
+  if (!key) {
+    console.error('WEBHOOK_KEY not set — cannot build Twilio recording callback URL');
+    return null;
+  }
+  return `${SUPABASE_URL.replace(/\/$/, '')}/functions/v1/twilio-recording-webhook?key=${encodeURIComponent(key)}`;
 }
 
 app.set('trust proxy', 1);
@@ -218,21 +224,17 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   }
 });
 
+// Twilio recording status callbacks are now handled by the Supabase Edge
+// Function `twilio-recording-webhook`. Keep this route as a 410 in case any
+// stale Twilio rooms still try to deliver here, so we can see it in the logs.
 app.post(
   '/twilio/recording-webhook',
   express.urlencoded({ extended: false }),
-  async (req, res) => {
-    console.log('[twilio-webhook] received event=%s roomSid=%s compositionSid=%s',
+  (req, res) => {
+    console.warn('[twilio-webhook] received on Railway (deprecated) event=%s roomSid=%s — should be hitting the Supabase Edge Function instead',
       req.body?.StatusCallbackEvent,
-      req.body?.RoomSid,
-      req.body?.CompositionSid);
-    try {
-      await handleTwilioRecordingEvent(req.body);
-      res.status(200).send('ok');
-    } catch (err) {
-      console.error('[twilio-webhook] handler error:', err);
-      res.status(500).send('error');
-    }
+      req.body?.RoomSid);
+    res.status(410).send('Gone — use the Supabase Edge Function');
   }
 );
 
@@ -247,6 +249,8 @@ const verifyToken = async (req, res, next) => {
     const { data: { user }, error } = await supabase.auth.getUser(token);
     if (error || !user) return res.status(401).json({ error: 'Invalid token' });
     req.user = user;
+    req.userToken = token;
+    req.supabase = userClient(token); // RLS-scoped DB client for this request
     next();
   } catch (error) {
     return res.status(401).json({ error: 'Token verification failed' });
@@ -809,8 +813,8 @@ async function handleTransferFailed(transfer) {
 // Twilio room creation + recording webhook
 // ============================================================
 
-async function userHasActiveRecordingSubscription(userId) {
-  const { data } = await supabase
+async function userHasActiveRecordingSubscription(db, userId) {
+  const { data, error } = await db
     .from('subscriptions')
     .select('id')
     .eq('user_id', userId)
@@ -818,6 +822,7 @@ async function userHasActiveRecordingSubscription(userId) {
     .in('status', ['active', 'trialing'])
     .limit(1)
     .maybeSingle();
+  if (error) console.warn('[subscription-check] error for user=%s: %s', userId, error.message);
   return !!data;
 }
   app.post('/twilio/start-recording', verifyToken, async (req, res) => {
@@ -826,10 +831,11 @@ async function userHasActiveRecordingSubscription(userId) {
       console.log('[start-recording] callId=%s user=%s', callId, req.user.id);
       if (!callId) return res.status(400).json({ error: 'callId required' });
 
+      const db = req.supabase;
       const roomName = `call-${callId}`;
       const callbackUrl = getRecordingCallbackUrl();
       if (!callbackUrl) {
-        console.warn('[start-recording] PUBLIC_BACKEND_URL not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
+        console.warn('[start-recording] SUPABASE_URL or WEBHOOK_KEY not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
       }
 
       let room;
@@ -868,16 +874,15 @@ async function userHasActiveRecordingSubscription(userId) {
       }
 
       // Only set recording_subscriber_id if it isn't already set (first caller wins).
-      // Otherwise a non-subscriber calling /start-recording second would overwrite the real subscriber.
       try {
-        const { data: existingCall, error: lookupErr } = await supabase
+        const { data: existingCall, error: lookupErr } = await db
           .from('calls')
           .select('id, recording_subscriber_id, twilio_room_sid')
           .eq('id', callId)
           .maybeSingle();
         if (lookupErr) console.warn('[start-recording] calls lookup error:', lookupErr.message);
         if (!existingCall) {
-          console.warn('[start-recording] no calls row found for callId=%s — recording WILL still happen but room-ended webhook will not find this call. Make sure the call row is inserted before /start-recording.', callId);
+          console.warn('[start-recording] no calls row visible for callId=%s under user JWT — either the row does not exist or RLS blocks SELECT for this user. Recording cannot be linked.', callId);
         }
 
         const update = {
@@ -887,7 +892,7 @@ async function userHasActiveRecordingSubscription(userId) {
         if (!existingCall?.recording_subscriber_id) {
           update.recording_subscriber_id = req.user.id;
         }
-        const { data: updated, error: updErr } = await supabase
+        const { data: updated, error: updErr } = await db
           .from('calls')
           .update(update)
           .eq('id', callId)
@@ -905,39 +910,35 @@ async function userHasActiveRecordingSubscription(userId) {
     }
   });
 
-app.post('/twilio/create-room', verifyToken, async (req, res) => {                                               
-    try {                                                                                                        
-      const { callId } = req.body;                                                                                 
-      if (!callId) return res.status(400).json({ error: 'callId required' });                                      
-                                                                                                                 
-      const { data: callRow } = await supabase                                                                     
-        .from('calls')                                      
-        .select('id, caller_id, receiver_id, recording_enabled, twilio_room_sid')                                  
-        .eq('id', callId)                                                                                          
-        .single();                                                                                               
-      if (!callRow) return res.status(404).json({ error: 'call not found' });                                      
-      if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {                              
-        return res.status(403).json({ error: 'not a call participant' });                                          
-      }                                                                                                            
-                                                                                                                   
-      const candidates = [callRow.caller_id, callRow.receiver_id];                                                 
-      let subscriberId = null;                                                                                   
-      if (await userHasActiveRecordingSubscription(req.user.id)) {                                                 
-        subscriberId = req.user.id;                                                                                
-      } else {                                                                                                     
-        for (const uid of candidates) {                                                                            
-          if (uid === req.user.id) continue;                                                                       
-          if (await userHasActiveRecordingSubscription(uid)) {                                                   
-            subscriberId = uid;                                                                                    
-            break;
-          }                                                                                                        
-        }                                                   
-      }                                                                                                          
+app.post('/twilio/create-room', verifyToken, async (req, res) => {
+    try {
+      const { callId } = req.body;
+      if (!callId) return res.status(400).json({ error: 'callId required' });
+
+      const db = req.supabase;
+      const { data: callRow, error: lookupErr } = await db
+        .from('calls')
+        .select('id, caller_id, receiver_id, recording_enabled, twilio_room_sid')
+        .eq('id', callId)
+        .maybeSingle();
+      if (lookupErr) console.warn('[create-room] calls lookup error:', lookupErr.message);
+      if (!callRow) return res.status(404).json({ error: 'call not found' });
+      if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
+        return res.status(403).json({ error: 'not a call participant' });
+      }
+
+      // Subscription lookup uses the user JWT, so the requesting user can only
+      // see their own subscription row. That's fine for the common case where
+      // the caller is checking whether *they* enabled recording.
+      let subscriberId = null;
+      if (await userHasActiveRecordingSubscription(db, req.user.id)) {
+        subscriberId = req.user.id;
+      }
 
       const roomName = `call-${callId}`;
       const callbackUrl = getRecordingCallbackUrl();
       if (subscriberId && !callbackUrl) {
-        console.warn('[create-room] PUBLIC_BACKEND_URL not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
+        console.warn('[create-room] SUPABASE_URL or WEBHOOK_KEY not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
       }
 
       let room;
@@ -966,12 +967,12 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
       }
 
       if (subscriberId && !callRow.recording_enabled) {
-        await supabase
+        await db
           .from('calls')
           .update({ recording_enabled: true, recording_subscriber_id: subscriberId, twilio_room_sid: room.sid })
           .eq('id', callId);
       } else if (!callRow.twilio_room_sid) {
-        await supabase.from('calls').update({ twilio_room_sid: room.sid }).eq('id', callId);
+        await db.from('calls').update({ twilio_room_sid: room.sid }).eq('id', callId);
       }
 
       res.json({ recording: !!subscriberId, roomCreated: true, roomSid: room.sid });
@@ -989,11 +990,12 @@ app.post('/twilio/end-room', verifyToken, async (req, res) => {
     if (!callId) return res.status(400).json({ error: 'callId required' });
     console.log('[end-room] callId=%s user=%s', callId, req.user.id);
 
-    const { data: callRow } = await supabase
+    const { data: callRow, error: lookupErr } = await req.supabase
       .from('calls')
       .select('id, caller_id, receiver_id, twilio_room_sid')
       .eq('id', callId)
       .maybeSingle();
+    if (lookupErr) console.warn('[end-room] calls lookup error:', lookupErr.message);
     if (!callRow) return res.status(404).json({ error: 'call not found' });
     if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
       return res.status(403).json({ error: 'not a call participant' });
@@ -1024,173 +1026,15 @@ app.post('/twilio/end-room', verifyToken, async (req, res) => {
   }
 });
 
-async function handleTwilioRecordingEvent(body) {
-  const event = body.StatusCallbackEvent;
-  const roomSid = body.RoomSid;
-  if (!roomSid && !body.CompositionSid) {
-    console.warn('[recording-event] no RoomSid/CompositionSid in payload, ignoring');
-    return;
-  }
-
-  if (event === 'room-ended') {
-    const roomName = body.RoomName || '';
-    console.log('[recording-event] room-ended roomSid=%s roomName=%s — looking up call', roomSid, roomName);
-
-    // Primary lookup: by stored twilio_room_sid
-    let { data: callRow, error: callErr } = await supabase
-      .from('calls')
-      .select('id, recording_subscriber_id, call_type')
-      .eq('twilio_room_sid', roomSid)
-      .maybeSingle();
-    if (callErr) console.error('[recording-event] calls lookup-by-sid error:', callErr.message);
-
-    // Fallback: derive callId from roomName (we always create rooms as `call-<callId>`)
-    if (!callRow && roomName.startsWith('call-')) {
-      const derivedCallId = roomName.slice('call-'.length);
-      console.log('[recording-event] sid lookup failed, retrying by callId=%s parsed from roomName', derivedCallId);
-      const { data: byId, error: byIdErr } = await supabase
-        .from('calls')
-        .select('id, recording_subscriber_id, call_type')
-        .eq('id', derivedCallId)
-        .maybeSingle();
-      if (byIdErr) console.error('[recording-event] calls lookup-by-id error:', byIdErr.message);
-      callRow = byId || null;
-    }
-
-    if (!callRow) {
-      console.warn('[recording-event] no call row found for roomSid=%s roomName=%s — skipping', roomSid, roomName);
-      return;
-    }
-    if (!callRow.recording_subscriber_id) {
-      console.log('[recording-event] callId=%s has no recording_subscriber_id — skipping composition', callRow.id);
-      return;
-    }
-
-    const callbackUrl = getRecordingCallbackUrl();
-    const format = callRow.call_type === 'video' ? 'mp4' : 'mp3';
-    console.log('[recording-event] creating composition callId=%s format=%s callback=%s',
-      callRow.id, format, callbackUrl || '(none)');
-
-    let composition;
-    try {
-      composition = await twilioClient.video.v1.compositions.create({
-        roomSid,
-        audioSources: ['*'],
-        videoLayout:
-          callRow.call_type === 'video' ? { grid: { video_sources: ['*'] } } : undefined,
-        format,
-        statusCallback: callbackUrl || undefined,
-        statusCallbackMethod: callbackUrl ? 'POST' : undefined,
-      });
-      console.log('[recording-event] composition created sid=%s status=%s', composition.sid, composition.status);
-    } catch (e) {
-      console.error('[recording-event] composition create failed:', e?.status, e?.code, e?.message);
-      await supabase.from('call_recordings').insert({
-        call_id: callRow.id,
-        subscriber_user_id: callRow.recording_subscriber_id,
-        twilio_composition_sid: null,
-        storage_path: '',
-        media_format: format,
-        call_type: callRow.call_type,
-        status: 'failed',
-      });
-      return;
-    }
-
-    const { error: insErr } = await supabase.from('call_recordings').insert({
-      call_id: callRow.id,
-      subscriber_user_id: callRow.recording_subscriber_id,
-      twilio_composition_sid: composition.sid,
-      storage_path: '',
-      media_format: format,
-      call_type: callRow.call_type,
-      status: 'processing',
-    });
-    if (insErr) console.error('[recording-event] call_recordings insert error:', insErr.message);
-    return;
-  }
-
-  if (event === 'composition-available') {
-    const compositionSid = body.CompositionSid;
-    if (!compositionSid) {
-      console.warn('[recording-event] composition-available with no CompositionSid');
-      return;
-    }
-    console.log('[recording-event] composition-available sid=%s', compositionSid);
-
-    const { data: rec } = await supabase
-      .from('call_recordings')
-      .select('id, subscriber_user_id, call_id, media_format')
-      .eq('twilio_composition_sid', compositionSid)
-      .maybeSingle();
-    if (!rec) {
-      console.warn('[recording-event] no call_recordings row for composition=%s', compositionSid);
-      return;
-    }
-
-    const composition = await twilioClient.video.v1.compositions(compositionSid).fetch();
-    const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
-
-    const mediaResp = await fetch(mediaUrl, {
-      headers: {
-        Authorization:
-          'Basic ' +
-          Buffer.from(`${process.env.TWILIO_API_KEY}:${process.env.TWILIO_API_SECRET}`).toString('base64'),
-      },
-      redirect: 'follow',
-    });
-    if (!mediaResp.ok) {
-      console.error('[recording-event] fetch composition media failed:', mediaResp.status, mediaResp.statusText);
-      await supabase.from('call_recordings').update({ status: 'failed' }).eq('id', rec.id);
-      return;
-    }
-    const buffer = await mediaResp.buffer();
-    console.log('[recording-event] downloaded media bytes=%d composition=%s', buffer.length, compositionSid);
-
-    const ext = rec.media_format;
-    const path = `${rec.subscriber_user_id}/${rec.call_id}.${ext}`;
-    const { error: uploadErr } = await supabase.storage
-      .from('recordings')
-      .upload(path, buffer, {
-        contentType: ext === 'mp4' ? 'video/mp4' : 'audio/mpeg',
-        upsert: true,
-      });
-    if (uploadErr) {
-      console.error('[recording-event] storage upload failed:', uploadErr.message);
-      await supabase.from('call_recordings').update({ status: 'failed' }).eq('id', rec.id);
-      return;
-    }
-    console.log('[recording-event] uploaded to storage path=%s', path);
-
-    await supabase
-      .from('call_recordings')
-      .update({
-        storage_path: path,
-        size_bytes: buffer.length,
-        duration_seconds: composition.duration || null,
-        status: 'ready',
-      })
-      .eq('id', rec.id);
-
-    try {
-      await twilioClient.video.v1.compositions(compositionSid).remove();
-    } catch (e) {
-      console.warn('[recording-event] failed to remove composition:', e.message);
-    }
-    return;
-  }
-
-  console.log('[recording-event] unhandled event=%s roomSid=%s', event, roomSid);
-}
-
 // Signed download URL for a recording (subscriber-only)
 app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
   try {
-    const { data: rec } = await supabase
+    const { data: rec, error: lookupErr } = await req.supabase
       .from('call_recordings')
       .select('id, subscriber_user_id, storage_path, status')
       .eq('id', req.params.id)
       .maybeSingle();
+    if (lookupErr) console.warn('[signed-url] lookup error:', lookupErr.message);
 
     if (!rec) return res.status(404).json({ error: 'not found' });
     if (rec.subscriber_user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' });
@@ -1198,7 +1042,7 @@ app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
       return res.status(409).json({ error: 'recording not ready' });
     }
 
-    const { data, error } = await supabase.storage
+    const { data, error } = await req.supabase.storage
       .from('recordings')
       .createSignedUrl(rec.storage_path, 60 * 10);
     if (error) throw error;
