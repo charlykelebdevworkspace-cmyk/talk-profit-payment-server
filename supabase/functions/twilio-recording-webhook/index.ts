@@ -141,25 +141,59 @@ async function handleRoomEnded(roomSid: string, roomName: string) {
   }
 
   const format = call.call_type === "video" ? "mp4" : "mp3";
-  console.log(`[room-ended] creating composition callId=${call.id} format=${format}`);
 
-  let composition: any;
+  // Diagnostics: fetch the room and its track recordings before composing.
+  // Twilio's "no recordings for the given room" 400 is generic — knowing the
+  // room config and the actual recording count makes the failure mode explicit.
+  let room: any = null;
   try {
-    const params: Record<string, string | string[]> = {
-      RoomSid: roomSid,
-      AudioSources: "*",
-      Format: format,
-      StatusCallback: SELF_URL,
-      StatusCallbackMethod: "POST",
-    };
-    if (call.call_type === "video") {
-      params.VideoLayout = JSON.stringify({ grid: { video_sources: ["*"] } });
-    }
-    composition = await twilio("/v1/Compositions", "POST", params);
-    console.log(`[room-ended] composition sid=${composition.sid} status=${composition.status}`);
+    room = await twilio(`/v1/Rooms/${roomSid}`);
+    console.log(
+      `[room-ended] room sid=${roomSid} type=${room.type} record_on_connect=${room.record_participants_on_connect} duration=${room.duration} status=${room.status}`,
+    );
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("[room-ended] composition create failed:", msg);
+    console.warn("[room-ended] room fetch failed:", err instanceof Error ? err.message : err);
+  }
+
+  let recordingCount = 0;
+  let videoRecordingCount = 0;
+  let audioRecordingCount = 0;
+  try {
+    const list = await twilio(`/v1/Rooms/${roomSid}/Recordings?PageSize=100`);
+    const recordings: any[] = list?.recordings ?? [];
+    recordingCount = recordings.length;
+    for (const r of recordings) {
+      if (r.type === "video") videoRecordingCount++;
+      else if (r.type === "audio") audioRecordingCount++;
+    }
+    console.log(
+      `[room-ended] room recordings count=${recordingCount} (audio=${audioRecordingCount} video=${videoRecordingCount})`,
+    );
+  } catch (err) {
+    console.warn("[room-ended] room recordings list failed:", err instanceof Error ? err.message : err);
+  }
+
+  // List participants — this distinguishes "nobody joined" from "joined but
+  // didn't publish any track".
+  try {
+    const list = await twilio(`/v1/Rooms/${roomSid}/Participants?PageSize=50`);
+    const participants: any[] = list?.participants ?? [];
+    console.log(`[room-ended] participants count=${participants.length}`);
+    for (const p of participants) {
+      console.log(
+        `[room-ended]   participant identity=${p.identity} status=${p.status} duration=${p.duration} startTime=${p.start_time} endTime=${p.end_time}`,
+      );
+    }
+  } catch (err) {
+    console.warn("[room-ended] participants list failed:", err instanceof Error ? err.message : err);
+  }
+
+  if (recordingCount === 0) {
+    const reason =
+      room && room.record_participants_on_connect === false
+        ? "room was created without record_participants_on_connect; recordingRules.update() does not record participants who were already connected"
+        : "no participant published any audio/video tracks while recording was active";
+    console.error(`[room-ended] aborting composition for callId=${call.id} — ${reason}`);
     await supabase.from("call_recordings").insert({
       call_id: call.id,
       subscriber_user_id: call.recording_subscriber_id,
@@ -172,12 +206,56 @@ async function handleRoomEnded(roomSid: string, roomName: string) {
     return;
   }
 
+  // If the call is supposed to be video but Twilio only captured audio tracks
+  // (camera off, audio-only join, etc.), fall back to mp3 so the composition
+  // doesn't fail with "VideoLayout has no matching sources".
+  let effectiveFormat = format;
+  let useVideoLayout = call.call_type === "video";
+  if (useVideoLayout && videoRecordingCount === 0) {
+    console.warn(
+      `[room-ended] call_type=video but no video recordings — falling back to mp3 audio composition`,
+    );
+    effectiveFormat = "mp3";
+    useVideoLayout = false;
+  }
+
+  console.log(`[room-ended] creating composition callId=${call.id} format=${effectiveFormat}`);
+
+  let composition: any;
+  try {
+    const params: Record<string, string | string[]> = {
+      RoomSid: roomSid,
+      AudioSources: "*",
+      Format: effectiveFormat,
+      StatusCallback: SELF_URL,
+      StatusCallbackMethod: "POST",
+    };
+    if (useVideoLayout) {
+      params.VideoLayout = JSON.stringify({ grid: { video_sources: ["*"] } });
+    }
+    composition = await twilio("/v1/Compositions", "POST", params);
+    console.log(`[room-ended] composition sid=${composition.sid} status=${composition.status}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[room-ended] composition create failed:", msg);
+    await supabase.from("call_recordings").insert({
+      call_id: call.id,
+      subscriber_user_id: call.recording_subscriber_id,
+      twilio_composition_sid: null,
+      storage_path: "",
+      media_format: effectiveFormat,
+      call_type: call.call_type,
+      status: "failed",
+    });
+    return;
+  }
+
   const { error: insErr } = await supabase.from("call_recordings").insert({
     call_id: call.id,
     subscriber_user_id: call.recording_subscriber_id,
     twilio_composition_sid: composition.sid,
     storage_path: "",
-    media_format: format,
+    media_format: effectiveFormat,
     call_type: call.call_type,
     status: "processing",
   });
@@ -212,7 +290,10 @@ async function handleCompositionAvailable(compositionSid: string) {
     return;
   }
 
-  const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
+  // Build the media URL from the SID directly. composition.url from Twilio is
+  // already a fully-qualified URL, so concatenating a host prefix produces a
+  // broken double-prefixed URL.
+  const mediaUrl = `https://video.twilio.com/v1/Compositions/${compositionSid}/Media`;
   const mediaResp = await fetch(mediaUrl, {
     headers: { Authorization: TWILIO_BASIC_AUTH },
     redirect: "follow",

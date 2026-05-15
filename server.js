@@ -832,6 +832,12 @@ async function userHasActiveRecordingSubscription(db, userId) {
       if (!callId) return res.status(400).json({ error: 'callId required' });
 
       const db = req.supabase;
+
+      if (!(await userHasActiveRecordingSubscription(db, req.user.id))) {
+        console.warn('[start-recording] user=%s has no active call_recording subscription', req.user.id);
+        return res.status(403).json({ error: 'active call recording subscription required' });
+      }
+
       const roomName = `call-${callId}`;
       const callbackUrl = getRecordingCallbackUrl();
       if (!callbackUrl) {
@@ -1038,6 +1044,10 @@ app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
 
     if (!rec) return res.status(404).json({ error: 'not found' });
     if (rec.subscriber_user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' });
+    if (!(await userHasActiveRecordingSubscription(req.supabase, req.user.id))) {
+      console.warn('[signed-url] user=%s no active call_recording subscription', req.user.id);
+      return res.status(403).json({ error: 'active call recording subscription required' });
+    }
     if (rec.status !== 'ready' || !rec.storage_path) {
       return res.status(409).json({ error: 'recording not ready' });
     }
