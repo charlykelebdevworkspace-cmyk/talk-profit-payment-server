@@ -590,8 +590,10 @@ app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
 // Call Recording Subscription
 // ============================================================
 
-async function getOrCreateStripeCustomer(userId, email) {
-  const { data: existing } = await supabase
+async function getOrCreateStripeCustomer(db, userId, email) {
+  // Read under the user's JWT so RLS allows it — the anon client can't see the
+  // row and would create a duplicate Stripe customer on every checkout.
+  const { data: existing } = await db
     .from('subscriptions')
     .select('stripe_customer_id')
     .eq('user_id', userId)
@@ -614,7 +616,7 @@ app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) =
       return res.status(500).json({ error: 'STRIPE_RECORDING_PRICE_ID not configured' });
     }
     const { successUrl, cancelUrl } = req.body;
-    const customerId = await getOrCreateStripeCustomer(req.user.id, req.user.email);
+    const customerId = await getOrCreateStripeCustomer(req.supabase, req.user.id, req.user.email);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -637,7 +639,9 @@ app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) =
 
 app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
   try {
-    const { data: sub } = await supabase
+    // Read under the user's JWT (RLS) — the anon client can't see this row and
+    // would make cancellation always return 404.
+    const { data: sub } = await req.supabase
       .from('subscriptions')
       .select('stripe_subscription_id')
       .eq('user_id', req.user.id)
@@ -653,10 +657,9 @@ app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
       cancel_at_period_end: true,
     });
 
-    await supabase
-      .from('subscriptions')
-      .update({ cancel_at_period_end: true })
-      .eq('stripe_subscription_id', sub.stripe_subscription_id);
+    // The resulting customer.subscription.updated webhook syncs the DB row
+    // through the SECURITY DEFINER RPC, so no direct write is needed here (the
+    // anon client can't write the row anyway).
 
     res.json({ success: true, cancel_at_period_end: updated.cancel_at_period_end });
   } catch (error) {
@@ -731,19 +734,35 @@ async function handleRecordingSubscriptionEvent(event) {
 }
 
 async function upsertSubscriptionRow(userId, subscription, customerId) {
-  await supabase.from('subscriptions').upsert(
-    {
-      user_id: userId,
-      product: subscription.metadata?.product || 'call_recording',
-      stripe_customer_id: typeof customerId === 'string' ? customerId : customerId?.id,
-      stripe_subscription_id: subscription.id,
-      status: subscription.status,
-      current_period_end: subscription.current_period_end
-        ? new Date(subscription.current_period_end * 1000).toISOString()
-        : null,
-      cancel_at_period_end: !!subscription.cancel_at_period_end,
-    },
-    { onConflict: 'stripe_subscription_id' }
+  // The backend runs with the anon key (no service-role), so a direct
+  // supabase.from('subscriptions').upsert() is an anonymous request that RLS
+  // silently rejects — which is why paid subscriptions never showed up in the
+  // app. Write through a SECURITY DEFINER RPC that bypasses RLS instead.
+  const cust = typeof customerId === 'string' ? customerId : customerId?.id;
+  const { error } = await supabase.rpc('upsert_recording_subscription', {
+    p_user_id: userId,
+    p_product: subscription.metadata?.product || 'call_recording',
+    p_stripe_customer_id: cust ?? null,
+    p_stripe_subscription_id: subscription.id,
+    p_status: subscription.status,
+    p_current_period_end: subscription.current_period_end
+      ? new Date(subscription.current_period_end * 1000).toISOString()
+      : null,
+    p_cancel_at_period_end: !!subscription.cancel_at_period_end,
+  });
+
+  // Don't swallow the error: throwing makes the webhook return 500 so Stripe
+  // retries, instead of pretending the write succeeded.
+  if (error) {
+    console.error(
+      '[subscription-upsert] failed user=%s sub=%s status=%s: %s',
+      userId, subscription.id, subscription.status, error.message
+    );
+    throw error;
+  }
+  console.log(
+    '[subscription-upsert] ok user=%s sub=%s status=%s',
+    userId, subscription.id, subscription.status
   );
 }
 
@@ -1064,6 +1083,54 @@ app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
   }
 });
 
+// ============================================================
+// Admin: backfill subscriptions from Stripe into the DB.
+// One-off repair for users who paid while the webhook write was broken.
+// Protected by a shared secret (ADMIN_KEY, falls back to WEBHOOK_KEY).
+// Call: POST /admin/backfill-subscriptions  header  x-admin-key: <secret>
+// ============================================================
+app.post('/admin/backfill-subscriptions', async (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || process.env.WEBHOOK_KEY;
+  if (!adminKey) {
+    return res.status(500).json({ error: 'ADMIN_KEY/WEBHOOK_KEY not configured' });
+  }
+  const provided = req.headers['x-admin-key'] || req.body?.key;
+  if (provided !== adminKey) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const result = { processed: 0, upserted: 0, skipped_no_user_id: 0, failed: 0 };
+  try {
+    // Walk every subscription in the Stripe account (all statuses) and sync the
+    // row using the same SECURITY DEFINER RPC the webhook uses.
+    for await (const subscription of stripe.subscriptions.list({
+      status: 'all',
+      limit: 100,
+      expand: ['data.customer'],
+    })) {
+      result.processed++;
+      const userId = subscription.metadata?.user_id;
+      if (!userId) {
+        result.skipped_no_user_id++;
+        console.warn('[backfill] subscription %s has no user_id metadata — skipped', subscription.id);
+        continue;
+      }
+      try {
+        await upsertSubscriptionRow(userId, subscription, subscription.customer);
+        result.upserted++;
+      } catch (err) {
+        result.failed++;
+        console.error('[backfill] upsert failed for sub %s: %s', subscription.id, err.message);
+      }
+    }
+    console.log('[backfill] done', result);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('[backfill] failed:', error);
+    res.status(500).json({ error: 'backfill failed', ...result });
+  }
+});
+
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
@@ -1080,6 +1147,7 @@ app.use('*', (req, res) => {
       'POST /stripe/process-withdrawal',
       'POST /stripe/create-subscription-checkout',
       'POST /stripe/cancel-subscription',
+      'POST /admin/backfill-subscriptions',
       'POST /stripe/webhook',
       'POST /webhook',
       'POST /twilio/create-room',
