@@ -874,22 +874,51 @@ async function userHasActiveRecordingSubscription(db, userId) {
         room = null;
       }
 
-      let recordingMode = 'created'; // 'created' | 'rules-updated'
-      if (!room || room.status === 'completed') {
-        room = await twilioClient.video.v1.rooms.create({
+      const createRecordingRoom = () =>
+        twilioClient.video.v1.rooms.create({
           uniqueName: roomName,
           type: 'group',
           recordParticipantsOnConnect: true,
           statusCallback: callbackUrl || undefined,
           statusCallbackMethod: callbackUrl ? 'POST' : undefined,
-          emptyRoomTimeout: 1,
-          unusedRoomTimeout: 1,
+          // Generous enough to survive a full ring cycle and a brief reconnect.
+          // At 1 minute, a room pre-created when the call started would time out
+          // while the phone was still ringing; the answering client then joined
+          // a Twilio-auto-created peer-to-peer room and the call went unrecorded.
+          emptyRoomTimeout: 5,
+          unusedRoomTimeout: 5,
         });
+
+      let recordingMode = 'created'; // 'created' | 'recreated' | 'rules-updated'
+      if (!room || room.status === 'completed') {
+        room = await createRecordingRoom();
         console.log('[start-recording] created group room sid=%s callback=%s', room.sid, callbackUrl || '(none)');
-      } else if (room.type !== 'group') {
-        return res.status(409).json({
-          error: 'Room is peer-to-peer. End the call and start a new one to enable recording.',
-        });
+      } else if (room.type !== 'group' || room.recordParticipantsOnConnect === false) {
+        // The room exists but can't produce a usable recording: either it is
+        // peer-to-peer, or it was created without record-on-connect (recording
+        // rules do NOT retroactively record already-connected participants).
+        // If nobody has joined yet we can still fix it by replacing the room.
+        let connected = [];
+        try {
+          connected = await twilioClient.video.v1
+            .rooms(room.sid)
+            .participants.list({ status: 'connected', limit: 5 });
+        } catch (e) {
+          console.warn('[start-recording] participants.list failed:', e?.message);
+        }
+
+        if (connected.length > 0) {
+          return res.status(409).json({
+            error: 'Room already in progress without recording. End the call and start a new one to enable recording.',
+          });
+        }
+
+        console.warn('[start-recording] replacing non-recording room sid=%s type=%s record=%s',
+          room.sid, room.type, room.recordParticipantsOnConnect);
+        await twilioClient.video.v1.rooms(room.sid).update({ status: 'completed' });
+        room = await createRecordingRoom();
+        recordingMode = 'recreated';
+        console.log('[start-recording] recreated group room sid=%s', room.sid);
       } else {
         await twilioClient.video.v1.rooms(room.sid).recordingRules.update({
           rules: [{ type: 'include', all: true }],
@@ -984,8 +1013,8 @@ app.post('/twilio/create-room', verifyToken, async (req, res) => {
           recordParticipantsOnConnect: !!subscriberId,
           statusCallback: callbackUrl || undefined,
           statusCallbackMethod: callbackUrl ? 'POST' : undefined,
-          emptyRoomTimeout: 1,
-          unusedRoomTimeout: 1,
+          emptyRoomTimeout: 5,
+          unusedRoomTimeout: 5,
         });
         console.log('[create-room] created group room sid=%s record=%s callback=%s',
           room.sid, !!subscriberId, callbackUrl || '(none)');
