@@ -6,6 +6,7 @@ const dotenv = require('dotenv');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
+const { RtcTokenBuilder, RtcRole } = require('agora-token');
 
 dotenv.config();
 
@@ -57,6 +58,12 @@ const twilioClient = twilio(
   process.env.TWILIO_API_SECRET,
   { accountSid: process.env.TWILIO_ACCOUNT_SID }
 );
+
+// Agora powers livestreaming (Twilio Group Rooms cap at 50 participants).
+// APP_CERTIFICATE is what makes tokens meaningful — without it Agora accepts
+// anyone who knows the channel name, which for a paid stream is the whole farm.
+const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '';
 
 const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
@@ -1077,6 +1084,101 @@ app.post('/twilio/end-room', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('[end-room] failed:', error);
     res.status(500).json({ error: error.message || 'failed to end room' });
+  }
+});
+
+// ============================================================
+// Agora livestreaming tokens
+// ============================================================
+
+// Agora uids are 32-bit unsigned ints, but our identities are UUIDs. Derive a
+// stable uid per (user, stream) so a reconnect keeps the same uid and the token
+// stays valid. FNV-1a, masked to 31 bits to stay clear of the sign bit and 0
+// (0 means "let Agora assign one", which would not match the signed token).
+function agoraUid(userId, streamId) {
+  let hash = 0x811c9dc5;
+  const input = `${userId}:${streamId}`;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return (hash & 0x7fffffff) || 1;
+}
+
+// Mint a channel token. The ROLE IS DECIDED HERE, not by the client: host and
+// accepted guests publish, everyone else is subscribe-only. This is also where
+// a paid-entry check belongs once prices go live — the token is the paywall.
+app.post('/agora/token', verifyToken, async (req, res) => {
+  try {
+    const { streamId } = req.body;
+    if (!streamId) return res.status(400).json({ error: 'streamId required' });
+
+    if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
+      console.error('[agora-token] AGORA_APP_ID / AGORA_APP_CERTIFICATE not configured');
+      return res.status(500).json({ error: 'livestreaming not configured' });
+    }
+
+    const db = req.supabase;
+    const { data: stream, error: lookupErr } = await db
+      .from('streams')
+      .select('id, host_id, status, last_seen_at')
+      .eq('id', streamId)
+      .maybeSingle();
+    if (lookupErr) console.warn('[agora-token] stream lookup error:', lookupErr.message);
+    if (!stream) return res.status(404).json({ error: 'stream not found' });
+
+    const isHost = stream.host_id === req.user.id;
+
+    if (!isHost && stream.status !== 'live') {
+      return res.status(409).json({ error: 'stream has ended' });
+    }
+
+    // Publishers: the host, plus any guest they have pulled up on stage.
+    let canPublish = isHost;
+    if (!canPublish) {
+      const { data: guest } = await db
+        .from('stream_guests')
+        .select('status')
+        .eq('stream_id', streamId)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      canPublish = guest?.status === 'accepted';
+    }
+
+    // A kicked viewer must not be able to rejoin by asking for a new token.
+    if (!canPublish) {
+      const { data: viewer } = await db
+        .from('stream_viewers')
+        .select('kicked')
+        .eq('stream_id', streamId)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      if (viewer?.kicked) return res.status(403).json({ error: 'removed from this stream' });
+    }
+
+    const channel = `stream-${streamId}`;
+    const uid = agoraUid(req.user.id, streamId);
+    const role = canPublish ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+    const ttlSeconds = 60 * 60 * 4; // 4h, comfortably longer than a show
+    const expireAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channel,
+      uid,
+      role,
+      expireAt,
+      expireAt,
+    );
+
+    console.log('[agora-token] stream=%s user=%s uid=%d role=%s',
+      streamId, req.user.id, uid, canPublish ? 'publisher' : 'subscriber');
+
+    res.json({ appId: AGORA_APP_ID, channel, token, uid, canPublish, expiresAt: expireAt });
+  } catch (error) {
+    console.error('[agora-token] failed:', error);
+    res.status(500).json({ error: 'failed to mint token' });
   }
 });
 
