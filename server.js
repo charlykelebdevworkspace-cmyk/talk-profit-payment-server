@@ -1102,7 +1102,50 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', service: 'talk-profit-link-backend' });
 });
 
+/**
+ * Fail loudly if this server is not holding a service-role key.
+ *
+ * Handed the anon key instead, nothing crashes: RLS simply hides every row
+ * from it. Withdrawals report "insufficient earnings", co-hosts are never
+ * granted publisher tokens, paid viewers are told to pay again, and a captured
+ * card payment cannot be credited — each looking like a separate bug in a
+ * separate feature. One line at boot is cheaper than finding that out from a
+ * customer's charge.
+ */
+function checkServiceRoleKey() {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+  if (!key) {
+    console.error('❌ SUPABASE_SERVICE_ROLE_KEY is not set — every database write will be rejected');
+    return;
+  }
+
+  const payload = key.split('.')[1];
+  if (!payload) {
+    // Newer Supabase secret keys (sb_secret_…) are not JWTs and carry no
+    // readable claims; the runtime probe in /stripe/recover-topups covers it.
+    console.log('ℹ️  Supabase key is not a JWT — cannot check its role here');
+    return;
+  }
+
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    if (claims.role === 'service_role') {
+      console.log('✅ Supabase key is a service_role key');
+    } else {
+      console.error(
+        `❌ SUPABASE_SERVICE_ROLE_KEY has role="${claims.role}" — this is NOT a service-role key. ` +
+        'Payments cannot be credited, withdrawals and co-host tokens will fail, and paid viewers ' +
+        'will be asked to pay again. Copy the service_role key from Supabase → Settings → API.'
+      );
+    }
+  } catch (err) {
+    console.warn('⚠️  Could not read the Supabase key claims:', err.message);
+  }
+}
+
 app.listen(port, () => {
+  checkServiceRoleKey();
   console.log(`🚀 Talk Profit Link backend running on port ${port}`);
   console.log('🌐 Allowed origins:', allowedOrigins.join(', ') || '(none)');
   console.log('📊 Endpoints:');
