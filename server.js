@@ -538,7 +538,15 @@ async function grantTopUpCredits(userId, amountInCents, paymentIntentId) {
   });
 
   if (error) {
-    console.error('credit_wallet_topup failed:', paymentIntentId, error.message);
+    console.error('credit_wallet_topup failed:', {
+      paymentIntentId,
+      userId,
+      amount,
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+    });
     throw error;
   }
 
@@ -993,8 +1001,18 @@ app.post('/stripe/confirm-topup', verifyToken, async (req, res) => {
       balance: Number(result?.balance) || 0,
     });
   } catch (error) {
+    // The caller owns this payment and is out of pocket until it resolves, so
+    // they get the real reason rather than a dead end. Retrying is free and
+    // safe: the grant is keyed to the PaymentIntent, so a later success
+    // credits exactly once.
     console.error('confirm-topup failed:', error);
-    res.status(500).json({ error: 'Payment went through but credits could not be added. Contact support.' });
+    res.status(500).json({
+      error: 'Payment went through but credits could not be added.',
+      detail: error?.message || String(error),
+      code: error?.code || null,
+      hint: error?.hint || null,
+      paymentIntentId: req.body?.paymentIntentId || null,
+    });
   }
 });
 
