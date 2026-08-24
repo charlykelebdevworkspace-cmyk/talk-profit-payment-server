@@ -34,6 +34,27 @@ const STRIPE_WEBHOOK_SECRET_SUBSCRIPTION = process.env.STRIPE_WEBHOOK_SECRET_SUB
 // credit top-ups. May be the same endpoint as the subscription one.
 const STRIPE_WEBHOOK_SECRET_TOPUP = process.env.STRIPE_WEBHOOK_SECRET_TOPUP;
 
+// This project's Supabase instance is Lovable-managed, so no service-role key
+// is available to this server. Two consequences, both handled below:
+//
+//  1. Anything needing privilege — crediting a wallet — goes through the
+//     credit-topup Edge Function, which Supabase does hand a service role key.
+//     TOPUP_BRIDGE_SECRET is how this server proves it is the caller.
+//  2. Everything else this server reads is about the requesting user, and RLS
+//     already lets a user see their own rows. So those reads are made with the
+//     caller's own token instead of a privileged one. A user cannot lie by
+//     doing so: they cannot write stream_guests (host-only) or stream_entries
+//     (no insert policy at all).
+const TOPUP_BRIDGE_SECRET = process.env.TOPUP_BRIDGE_SECRET || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+/** A Supabase client that sees exactly what the given user is allowed to see. */
+const supabaseAsUser = (accessToken) =>
+  createClient(process.env.SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
 // What a single top-up may be, in dollars. Mirrors the custom-amount bounds in
 // src/components/TopUpDialog.tsx; the client's limits are a courtesy, this is
 // the one that counts.
@@ -176,6 +197,9 @@ const verifyToken = async (req, res, next) => {
       return res.status(401).json({ error: 'Invalid token' });
     }
     req.user = user;
+    // Kept so endpoints can read the database as this user; see
+    // supabaseAsUser above.
+    req.accessToken = token;
     next();
   } catch (error) {
     return res.status(401).json({ error: 'Token verification failed' });
@@ -529,25 +553,33 @@ async function handleStripeEvent(event) {
  * twice (webhook plus inline confirmation) credits once.
  */
 async function grantTopUpCredits(userId, amountInCents, paymentIntentId) {
-  const amount = Math.round(Number(amountInCents)) / 100;
+  if (!TOPUP_BRIDGE_SECRET) {
+    throw new Error('TOPUP_BRIDGE_SECRET is not set — cannot credit payments.');
+  }
 
-  const { data, error } = await supabase.rpc('credit_wallet_topup', {
-    p_user_id: userId,
-    p_amount: amount,
-    p_payment_intent: paymentIntentId,
+  const res = await fetch(`${process.env.SUPABASE_URL}/functions/v1/credit-topup`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-bridge-secret': TOPUP_BRIDGE_SECRET,
+      // The gateway wants an apikey even where it does not verify a JWT.
+      apikey: SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ userId, amountCents: amountInCents, paymentIntentId }),
   });
 
-  if (error) {
-    console.error('credit_wallet_topup failed:', {
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    const err = new Error(data?.detail || data?.error || `credit bridge failed (${res.status})`);
+    err.code = data?.code || null;
+    console.error('credit-topup bridge failed:', {
       paymentIntentId,
       userId,
-      amount,
-      message: error.message,
-      code: error.code,
-      details: error.details,
-      hint: error.hint,
+      status: res.status,
+      body: data,
     });
-    throw error;
+    throw err;
   }
 
   console.log('top-up:', paymentIntentId, data?.status, 'balance', data?.balance);
@@ -863,7 +895,14 @@ app.post('/agora/token', verifyToken, async (req, res) => {
     let canPublish = isHost;
 
     if (!isHost) {
-      const { data: viewer } = await supabase
+      // These three reads are all about the caller's own rows, so they are made
+      // as the caller. Read with an unprivileged key instead and RLS returns
+      // nothing — which silently reads as "not kicked, not a co-host, has not
+      // paid", so co-hosts were never promoted and paying viewers were asked to
+      // pay again.
+      const asUser = supabaseAsUser(req.accessToken);
+
+      const { data: viewer } = await asUser
         .from('stream_viewers')
         .select('kicked')
         .eq('stream_id', streamId)
@@ -876,7 +915,7 @@ app.post('/agora/token', verifyToken, async (req, res) => {
 
       // An accepted co-host publishes, and is never charged: they are part of
       // the show rather than its audience.
-      const { data: guest } = await supabase
+      const { data: guest } = await asUser
         .from('stream_guests')
         .select('status')
         .eq('stream_id', streamId)
@@ -889,7 +928,7 @@ app.post('/agora/token', verifyToken, async (req, res) => {
         // Entry is a ticket row, written only by pay_stream_entry(). Free
         // streams issue one too, so there is a single code path here and the
         // answer never depends on re-reading the price.
-        const { data: entry } = await supabase
+        const { data: entry } = await asUser
           .from('stream_entries')
           .select('id')
           .eq('stream_id', streamId)
@@ -1033,25 +1072,19 @@ app.post('/stripe/recover-topups', verifyToken, async (req, res) => {
     // are answered here so nobody has to guess.
     const diagnostics = {};
 
-    // RLS hides every wallet from anon; the service role reads straight
-    // through it. An empty result means this client is not what it should be.
-    const walletProbe = await supabase.from('wallets').select('user_id').limit(1);
-    diagnostics.databaseRole = walletProbe.error
-      ? `error: ${walletProbe.error.message}`
-      : walletProbe.data?.length
-        ? 'service_role — reaching past RLS as expected'
-        : 'NOT service_role — SUPABASE_SERVICE_ROLE_KEY looks like an anon key';
+    diagnostics.bridgeSecret = TOPUP_BRIDGE_SECRET
+      ? 'set'
+      : 'MISSING — set TOPUP_BRIDGE_SECRET here and on the credit-topup function';
 
-    // Amount 0 returns before touching anything, so this tests permission
-    // without moving money.
-    const rpcProbe = await supabase.rpc('credit_wallet_topup', {
-      p_user_id: req.user.id,
-      p_amount: 0,
-      p_payment_intent: 'permission-probe',
-    });
-    diagnostics.creditFunction = rpcProbe.error
-      ? `error: ${rpcProbe.error.message}`
-      : `callable (returned ${rpcProbe.data?.status})`;
+    // Amount 0 returns before the function touches anything, so this proves
+    // the whole path — secret, gateway, service role, grant — without moving
+    // money.
+    try {
+      const probe = await grantTopUpCredits(req.user.id, 0, 'permission-probe');
+      diagnostics.creditBridge = `reachable (returned ${probe?.status})`;
+    } catch (err) {
+      diagnostics.creditBridge = `error: ${err?.message || err}`;
+    }
 
     const intents = await stripe.paymentIntents.list({ limit: 100 });
 
@@ -1103,49 +1136,47 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Fail loudly if this server is not holding a service-role key.
+ * Report what this server can and cannot do, at boot.
  *
- * Handed the anon key instead, nothing crashes: RLS simply hides every row
- * from it. Withdrawals report "insufficient earnings", co-hosts are never
- * granted publisher tokens, paid viewers are told to pay again, and a captured
- * card payment cannot be credited — each looking like a separate bug in a
- * separate feature. One line at boot is cheaper than finding that out from a
- * customer's charge.
+ * It is not expected to hold a service-role key — the Supabase project is
+ * Lovable-managed and does not issue one to us. Privileged work therefore goes
+ * through the credit-topup Edge Function, and everything else is read as the
+ * requesting user. What must not be missing is the shared secret that lets
+ * this server prove itself to that function: without it, a captured card
+ * payment cannot become credits, and the only symptom is a customer out of
+ * pocket.
  */
-function checkServiceRoleKey() {
+function checkStartupConfig() {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const payload = key.split('.')[1];
 
   if (!key) {
-    console.error('❌ SUPABASE_SERVICE_ROLE_KEY is not set — every database write will be rejected');
-    return;
-  }
-
-  const payload = key.split('.')[1];
-  if (!payload) {
-    // Newer Supabase secret keys (sb_secret_…) are not JWTs and carry no
-    // readable claims; the runtime probe in /stripe/recover-topups covers it.
-    console.log('ℹ️  Supabase key is not a JWT — cannot check its role here');
-    return;
-  }
-
-  try {
-    const claims = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
-    if (claims.role === 'service_role') {
-      console.log('✅ Supabase key is a service_role key');
-    } else {
-      console.error(
-        `❌ SUPABASE_SERVICE_ROLE_KEY has role="${claims.role}" — this is NOT a service-role key. ` +
-        'Payments cannot be credited, withdrawals and co-host tokens will fail, and paid viewers ' +
-        'will be asked to pay again. Copy the service_role key from Supabase → Settings → API.'
+    console.error('❌ SUPABASE_SERVICE_ROLE_KEY is not set — no database access at all');
+  } else if (payload) {
+    try {
+      const claims = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+      console.log(
+        claims.role === 'service_role'
+          ? '✅ Supabase key is a service_role key'
+          : `ℹ️  Supabase key role is "${claims.role}" — reads are scoped to each caller, by design`
       );
+    } catch (err) {
+      console.warn('⚠️  Could not read the Supabase key claims:', err.message);
     }
-  } catch (err) {
-    console.warn('⚠️  Could not read the Supabase key claims:', err.message);
+  }
+
+  if (TOPUP_BRIDGE_SECRET) {
+    console.log('✅ TOPUP_BRIDGE_SECRET is set — credit bridge available');
+  } else {
+    console.error(
+      '❌ TOPUP_BRIDGE_SECRET is not set — cards can be charged but NOT credited. ' +
+      'Set it here and on the credit-topup Edge Function.'
+    );
   }
 }
 
 app.listen(port, () => {
-  checkServiceRoleKey();
+  checkStartupConfig();
   console.log(`🚀 Talk Profit Link backend running on port ${port}`);
   console.log('🌐 Allowed origins:', allowedOrigins.join(', ') || '(none)');
   console.log('📊 Endpoints:');
