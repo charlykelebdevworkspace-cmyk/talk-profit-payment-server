@@ -45,7 +45,7 @@ const STRIPE_WEBHOOK_SECRET_TOPUP = process.env.STRIPE_WEBHOOK_SECRET_TOPUP;
 //     caller's own token instead of a privileged one. A user cannot lie by
 //     doing so: they cannot write stream_guests (host-only) or stream_entries
 //     (no insert policy at all).
-const TOPUP_BRIDGE_SECRET = process.env.TOPUP_BRIDGE_SECRET || '';
+const WALLET_BRIDGE_SECRET = process.env.WALLET_BRIDGE_SECRET || process.env.TOPUP_BRIDGE_SECRET || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 /** A Supabase client that sees exactly what the given user is allowed to see. */
@@ -321,137 +321,209 @@ app.post('/stripe/account-status', verifyToken, async (req, res) => {
 });
 
 // Process withdrawal
+/**
+ * Pay a host's earnings out to their Stripe Connect account.
+ *
+ * The order matters and is the whole design. Earnings are reserved — debited,
+ * with a withdrawal_requests row created — before Stripe is asked to transfer
+ * anything, so the same balance cannot be withdrawn twice while a transfer is
+ * in flight. If Stripe then refuses, the reservation is released and the money
+ * goes back. Transferring first and debiting after would pay out money the
+ * platform might never reclaim.
+ *
+ * The amount and the destination are both decided here from the caller's
+ * verified identity. Previously the browser inserted its own withdrawal row,
+ * deducted its own earnings and passed the destination account id, which meant
+ * the ledger was written by the party being paid.
+ */
 app.post('/stripe/process-withdrawal', verifyToken, async (req, res) => {
+  const userId = req.user.id;
+  const amount = Number(req.body?.amount);
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'Enter an amount to withdraw.' });
+  }
+
+  let reservation;
+
   try {
-    const { withdrawalRequestId, accountId, amount } = req.body;
-    const userId = req.user.id;
+    // The destination comes from this user's own profile, never from the
+    // request body — an account id in a payload is not authority to be paid.
+    const { data: profile } = await supabaseAsUser(req.accessToken)
+      .from('profiles')
+      .select('stripe_connect_account_id, stripe_connect_enabled')
+      .eq('user_id', userId)
+      .maybeSingle();
 
-    // Convert amount to cents for Stripe
-    const amountInCents = Math.round(amount * 100);
-
-    // Start a Supabase transaction-like operation
-    try {
-      // Check if withdrawal request exists and is pending
-      const { data: withdrawalRequest, error: fetchError } = await supabase
-        .from('withdrawal_requests')
-        .select('*')
-        .eq('id', withdrawalRequestId)
-        .eq('user_id', userId)
-        .eq('status', 'pending')
-        .single();
-
-      if (fetchError || !withdrawalRequest) {
-        throw new Error('Invalid withdrawal request');
-      }
-
-      // Check user's earnings balance
-      const { data: wallet, error: walletError } = await supabase
-        .from('wallets')
-        .select('earnings')
-        .eq('user_id', userId)
-        .single();
-
-      if (walletError || !wallet || wallet.earnings < amount) {
-        throw new Error('Insufficient earnings');
-      }
-
-      // Update withdrawal request to processing
-      await supabase
-        .from('withdrawal_requests')
-        .update({ status: 'processing' })
-        .eq('id', withdrawalRequestId);
-
-      // Create Stripe transfer
-      const transfer = await stripe.transfers.create({
-        amount: amountInCents,
-        currency: 'usd',
-        destination: accountId,
-        metadata: {
-          withdrawalRequestId: withdrawalRequestId,
-          userId: userId
-        }
-      });
-
-      // Update user's earnings (subtract the withdrawn amount)
-      const newEarnings = wallet.earnings - amount;
-      await supabase
-        .from('wallets')
-        .update({ earnings: newEarnings })
-        .eq('user_id', userId);
-
-      // Update withdrawal request with success
-      await supabase
-        .from('withdrawal_requests')
-        .update({
-          status: 'completed',
-          stripe_transfer_id: transfer.id,
-          processed_at: new Date().toISOString()
-        })
-        .eq('id', withdrawalRequestId);
-
-      // Create transaction record
-      await supabase
-        .from('transactions')
-        .insert({
-          from_user_id: userId,
-          to_user_id: null, // External withdrawal
-          amount: -amount, // Negative for withdrawal
-          transaction_type: 'withdrawal',
-          description: `Withdrawal to Stripe Connect account: $${amount.toFixed(2)}`
-        });
-
-      res.json({
-        success: true,
-        transferId: transfer.id,
-        message: 'Withdrawal processed successfully'
-      });
-
-    } catch (error) {
-      // Update withdrawal request with failure
-      await supabase
-        .from('withdrawal_requests')
-        .update({
-          status: 'failed',
-          failure_reason: error.message,
-          processed_at: new Date().toISOString()
-        })
-        .eq('id', withdrawalRequestId);
-
-      throw error;
+    const accountId = profile?.stripe_connect_account_id;
+    if (!accountId) {
+      return res.status(400).json({ error: 'Set up your payout account before withdrawing.' });
     }
 
+    // Stripe is the authority on whether this account can actually receive
+    // money; a local flag can be stale.
+    const account = await stripe.accounts.retrieve(accountId);
+    if (!account.payouts_enabled) {
+      return res.status(400).json({
+        error: 'Your payout account is not ready yet. Finish Stripe onboarding first.',
+        helpUrl: 'https://dashboard.stripe.com/',
+      });
+    }
+
+    reservation = await walletBridge('begin_withdrawal', { userId, amount });
+
+    if (reservation?.status === 'insufficient') {
+      return res.status(400).json({
+        error: 'Not enough earnings to withdraw that much.',
+        availableBalance: Number(reservation.available) || 0,
+      });
+    }
+    if (reservation?.status !== 'reserved') {
+      return res.status(400).json({ error: `Could not start this withdrawal (${reservation?.status}).` });
+    }
   } catch (error) {
-    console.error('Error processing withdrawal:', error);
-    res.status(500).json({ 
-      error: 'Failed to process withdrawal',
-      message: error.message 
+    console.error('withdrawal reservation failed:', error);
+    return res.status(500).json({ error: 'Could not start this withdrawal.', detail: error?.message });
+  }
+
+  // From here the money is already debited, so every path must either settle
+  // the reservation or release it.
+  try {
+    const { data: profile } = await supabaseAsUser(req.accessToken)
+      .from('profiles')
+      .select('stripe_connect_account_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const transfer = await stripe.transfers.create(
+      {
+        amount: Math.round(amount * 100),
+        currency: 'usd',
+        destination: profile.stripe_connect_account_id,
+        transfer_group: `withdrawal_${reservation.request_id}`,
+        metadata: { userId, withdrawalRequestId: reservation.request_id },
+      },
+      // Retrying this request cannot create a second transfer.
+      { idempotencyKey: `withdrawal_${reservation.request_id}` }
+    );
+
+    const settled = await walletBridge('settle_withdrawal', {
+      requestId: reservation.request_id,
+      transferId: transfer.id,
+    });
+
+    res.json({
+      success: true,
+      transferId: transfer.id,
+      withdrawalRequestId: reservation.request_id,
+      status: settled?.status,
+      remainingEarnings: Number(reservation.remaining_earnings) || 0,
+      message: 'Withdrawal sent to your bank account.',
+    });
+  } catch (error) {
+    console.error('withdrawal transfer failed:', error);
+
+    // Put the earnings back. If this itself fails the row stays 'processing',
+    // which is a visible state to investigate rather than a silent loss.
+    try {
+      await walletBridge('fail_withdrawal', {
+        requestId: reservation.request_id,
+        reason: error?.message || 'transfer failed',
+      });
+    } catch (releaseError) {
+      console.error('CRITICAL: could not release withdrawal reservation', {
+        withdrawalRequestId: reservation.request_id,
+        userId,
+        amount,
+        releaseError: releaseError?.message,
+      });
+    }
+
+    const insufficientFunds = error?.code === 'balance_insufficient';
+    res.status(400).json({
+      error: insufficientFunds
+        ? 'The platform balance is too low to pay this out right now. Nothing was deducted.'
+        : 'The transfer could not be completed. Your earnings have been returned.',
+      detail: error?.message,
+      helpUrl: insufficientFunds ? 'https://dashboard.stripe.com/balance/overview' : undefined,
     });
   }
 });
 
-// ============================================================
-// Call Recording subscription
-// ============================================================
+/**
+ * Refund a credit top-up back to the card.
+ *
+ * Admin-only, and deliberately so: a user who could refund their own top-ups
+ * would be able to buy credits, spend them into a host's earnings, and take
+ * the money back. The credits are reversed *before* Stripe is asked for the
+ * refund, so a top-up whose credits are already spent is refused rather than
+ * driving a wallet negative.
+ */
+app.post('/stripe/refund-topup', verifyToken, async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body || {};
+    if (!paymentIntentId || typeof paymentIntentId !== 'string') {
+      return res.status(400).json({ error: 'paymentIntentId required' });
+    }
 
-async function getOrCreateStripeCustomer(userId, email) {
-  const { data: existing } = await supabase
-    .from('subscriptions')
-    .select('stripe_customer_id')
-    .eq('user_id', userId)
-    .not('stripe_customer_id', 'is', null)
-    .limit(1)
-    .maybeSingle();
+    const asUser = supabaseAsUser(req.accessToken);
+    const { data: isAdmin } = await asUser.rpc('is_admin', { uid: req.user.id });
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only an admin can refund a payment.' });
+    }
 
-  if (existing?.stripe_customer_id) return existing.stripe_customer_id;
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    if (paymentIntent.status !== 'succeeded') {
+      return res.status(400).json({ error: 'That payment did not complete, so there is nothing to refund.' });
+    }
+    if (paymentIntent.metadata?.type !== 'credit_topup') {
+      return res.status(400).json({ error: 'That payment was not a credit top-up.' });
+    }
 
-  const customer = await stripe.customers.create({
-    email,
-    metadata: { user_id: userId },
-  });
-  return customer.id;
-}
+    // One refund id per payment, so a retry reuses the same row and the same
+    // Stripe idempotency key rather than refunding twice.
+    const refundId = `refund_${paymentIntentId}`;
 
-// Create checkout session for the $50/mo recording subscription
+    const reversal = await walletBridge('reverse_credit_topup', { paymentIntentId, refundId });
+
+    if (reversal?.status === 'credits_spent') {
+      return res.status(409).json({
+        error: 'Those credits have already been spent, so this cannot be refunded automatically.',
+        balance: Number(reversal.balance) || 0,
+        required: Number(reversal.required) || 0,
+      });
+    }
+
+    try {
+      const refund = await stripe.refunds.create(
+        { payment_intent: paymentIntentId, metadata: { refundId } },
+        { idempotencyKey: refundId }
+      );
+
+      res.json({
+        status: 'refunded',
+        refundId: refund.id,
+        creditsReversed: reversal?.status === 'reversed' ? Number(reversal.amount) || 0 : 0,
+        amount: (paymentIntent.amount_received ?? paymentIntent.amount) / 100,
+      });
+    } catch (stripeError) {
+      // Stripe refused after the credits were taken back — put them back.
+      if (reversal?.status === 'reversed') {
+        await walletBridge('restore_credit_topup', { refundId }).catch((err) =>
+          console.error('CRITICAL: refund failed and credits were not restored', {
+            refundId,
+            error: err?.message,
+          })
+        );
+      }
+      throw stripeError;
+    }
+  } catch (error) {
+    console.error('refund-topup failed:', error);
+    res.status(500).json({ error: 'Could not refund this payment.', detail: error?.message });
+  }
+});
+
 app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) => {
   try {
     if (!STRIPE_RECORDING_PRICE_ID) {
@@ -552,39 +624,60 @@ async function handleStripeEvent(event) {
  * was. credit_wallet_topup() is keyed on the PaymentIntent id, so calling this
  * twice (webhook plus inline confirmation) credits once.
  */
-async function grantTopUpCredits(userId, amountInCents, paymentIntentId) {
-  if (!TOPUP_BRIDGE_SECRET) {
-    throw new Error('TOPUP_BRIDGE_SECRET is not set — cannot credit payments.');
+/**
+ * Ask the wallet-bridge Edge Function to move money.
+ *
+ * Every balance change goes through here. This server holds the Stripe key and
+ * so is the only thing that can know a payment or transfer really happened;
+ * the bridge holds the service-role key this project will not issue to us, and
+ * so is the only thing that can write the result. Neither half is enough
+ * alone, which is what keeps a browser out of it.
+ */
+async function walletBridge(action, payload) {
+  if (!WALLET_BRIDGE_SECRET) {
+    throw new Error('WALLET_BRIDGE_SECRET is not set — refusing to move money.');
   }
 
-  const res = await fetch(`${process.env.SUPABASE_URL}/functions/v1/credit-topup`, {
+  const res = await fetch(`${process.env.SUPABASE_URL}/functions/v1/wallet-bridge`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-bridge-secret': TOPUP_BRIDGE_SECRET,
+      'x-bridge-secret': WALLET_BRIDGE_SECRET,
       // The gateway wants an apikey even where it does not verify a JWT.
       apikey: SUPABASE_ANON_KEY,
     },
-    body: JSON.stringify({ userId, amountCents: amountInCents, paymentIntentId }),
+    body: JSON.stringify({ action, ...payload }),
   });
 
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    const err = new Error(data?.detail || data?.error || `credit bridge failed (${res.status})`);
+    const err = new Error(data?.detail || data?.error || `wallet bridge failed (${res.status})`);
     err.code = data?.code || null;
-    console.error('credit-topup bridge failed:', {
-      paymentIntentId,
-      userId,
-      status: res.status,
-      body: data,
-    });
+    console.error('wallet-bridge failed:', { action, status: res.status, body: data });
     throw err;
   }
 
+  return data;
+}
+
+/**
+ * Turn a succeeded PaymentIntent into wallet credits, exactly once.
+ *
+ * The amount comes from Stripe rather than from the caller — what is granted
+ * has to be what was actually captured. Keyed on the PaymentIntent id, so the
+ * inline confirmation and the webhook cannot both credit one purchase.
+ */
+async function grantTopUpCredits(userId, amountInCents, paymentIntentId) {
+  const data = await walletBridge('credit_topup', {
+    userId,
+    amountCents: amountInCents,
+    paymentIntentId,
+  });
   console.log('top-up:', paymentIntentId, data?.status, 'balance', data?.balance);
   return data;
 }
+
 
 async function upsertSubscriptionRow(userId, subscription, customerId) {
   await supabase
@@ -1072,9 +1165,9 @@ app.post('/stripe/recover-topups', verifyToken, async (req, res) => {
     // are answered here so nobody has to guess.
     const diagnostics = {};
 
-    diagnostics.bridgeSecret = TOPUP_BRIDGE_SECRET
+    diagnostics.bridgeSecret = WALLET_BRIDGE_SECRET
       ? 'set'
-      : 'MISSING — set TOPUP_BRIDGE_SECRET here and on the credit-topup function';
+      : 'MISSING — set WALLET_BRIDGE_SECRET here and on the wallet-bridge function';
 
     // Amount 0 returns before the function touches anything, so this proves
     // the whole path — secret, gateway, service role, grant — without moving
@@ -1165,12 +1258,12 @@ function checkStartupConfig() {
     }
   }
 
-  if (TOPUP_BRIDGE_SECRET) {
-    console.log('✅ TOPUP_BRIDGE_SECRET is set — credit bridge available');
+  if (WALLET_BRIDGE_SECRET) {
+    console.log('✅ WALLET_BRIDGE_SECRET is set — wallet bridge available');
   } else {
     console.error(
-      '❌ TOPUP_BRIDGE_SECRET is not set — cards can be charged but NOT credited. ' +
-      'Set it here and on the credit-topup Edge Function.'
+      '❌ WALLET_BRIDGE_SECRET is not set — cards can be charged but NOT credited, ' +
+      'and no withdrawal can be paid out. Set it here and on the wallet-bridge Edge Function.'
     );
   }
 }
@@ -1187,6 +1280,7 @@ app.listen(port, () => {
   console.log('  POST /stripe/create-account-link');
   console.log('  POST /stripe/account-status');
   console.log('  POST /stripe/process-withdrawal');
+  console.log('  POST /stripe/refund-topup');
   console.log('  POST /stripe/create-subscription-checkout');
   console.log('  POST /stripe/cancel-subscription');
   console.log('  POST /stripe/webhook');
