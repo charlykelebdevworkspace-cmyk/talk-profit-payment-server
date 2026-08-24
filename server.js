@@ -1027,6 +1027,32 @@ app.post('/stripe/confirm-topup', verifyToken, async (req, res) => {
 // money.
 app.post('/stripe/recover-topups', verifyToken, async (req, res) => {
   try {
+    // Two things can stop a captured payment becoming credits, and they look
+    // identical from outside: the grant on credit_wallet_topup missing, or
+    // SUPABASE_SERVICE_ROLE_KEY not actually being a service-role key. Both
+    // are answered here so nobody has to guess.
+    const diagnostics = {};
+
+    // RLS hides every wallet from anon; the service role reads straight
+    // through it. An empty result means this client is not what it should be.
+    const walletProbe = await supabase.from('wallets').select('user_id').limit(1);
+    diagnostics.databaseRole = walletProbe.error
+      ? `error: ${walletProbe.error.message}`
+      : walletProbe.data?.length
+        ? 'service_role — reaching past RLS as expected'
+        : 'NOT service_role — SUPABASE_SERVICE_ROLE_KEY looks like an anon key';
+
+    // Amount 0 returns before touching anything, so this tests permission
+    // without moving money.
+    const rpcProbe = await supabase.rpc('credit_wallet_topup', {
+      p_user_id: req.user.id,
+      p_amount: 0,
+      p_payment_intent: 'permission-probe',
+    });
+    diagnostics.creditFunction = rpcProbe.error
+      ? `error: ${rpcProbe.error.message}`
+      : `callable (returned ${rpcProbe.data?.status})`;
+
     const intents = await stripe.paymentIntents.list({ limit: 100 });
 
     const mine = intents.data.filter(
@@ -1064,7 +1090,7 @@ app.post('/stripe/recover-topups', verifyToken, async (req, res) => {
       }
     }
 
-    res.json({ found: mine.length, results });
+    res.json({ diagnostics, found: mine.length, results });
   } catch (error) {
     console.error('recover-topups failed:', error);
     res.status(500).json({ error: error?.message || 'Could not check for uncredited payments.' });
