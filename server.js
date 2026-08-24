@@ -30,6 +30,15 @@ const twilioClient = twilio(
 
 const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET_SUBSCRIPTION = process.env.STRIPE_WEBHOOK_SECRET_SUBSCRIPTION;
+// Signing secret for the endpoint that delivers payment_intent.succeeded for
+// credit top-ups. May be the same endpoint as the subscription one.
+const STRIPE_WEBHOOK_SECRET_TOPUP = process.env.STRIPE_WEBHOOK_SECRET_TOPUP;
+
+// What a single top-up may be, in dollars. Mirrors the custom-amount bounds in
+// src/components/TopUpDialog.tsx; the client's limits are a courtesy, this is
+// the one that counts.
+const TOPUP_MIN = 1;
+const TOPUP_MAX = 1000;
 
 // Middleware
 // Configure CORS to handle preflight and allow required headers/methods
@@ -82,16 +91,30 @@ app.post(
   '/stripe/webhook',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
+    // Subscriptions and credit top-ups can be configured as two separate
+    // Stripe endpoints, each with its own signing secret, or as one endpoint
+    // carrying both event types. Trying every secret we hold means either
+    // setup works and neither has to be pointed at a different URL.
     let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers['stripe-signature'],
-        STRIPE_WEBHOOK_SECRET_SUBSCRIPTION
-      );
-    } catch (err) {
-      console.error('Stripe webhook signature failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+    const secrets = [STRIPE_WEBHOOK_SECRET_SUBSCRIPTION, STRIPE_WEBHOOK_SECRET_TOPUP].filter(Boolean);
+    let lastError = null;
+
+    for (const secret of secrets) {
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.body,
+          req.headers['stripe-signature'],
+          secret
+        );
+        break;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    if (!event) {
+      console.error('Stripe webhook signature failed:', lastError?.message);
+      return res.status(400).send(`Webhook Error: ${lastError?.message || 'no matching signing secret'}`);
     }
 
     try {
@@ -179,6 +202,44 @@ app.post('/stripe/create-express-account', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Error creating Express account:', error);
     res.status(500).json({ error: 'Failed to create account' });
+  }
+});
+
+// Mint a fresh onboarding link for an account that already exists.
+//
+// Stripe's account links expire minutes after they are created, so anyone who
+// starts onboarding and comes back later needs a new one. The client has
+// called this since Connect was built; it was never implemented, so the
+// "continue setup" path 404'd.
+app.post('/stripe/create-account-link', verifyToken, async (req, res) => {
+  try {
+    const { accountId, returnUrl, refreshUrl } = req.body || {};
+    if (!accountId) return res.status(400).json({ error: 'accountId required' });
+
+    // The account has to be the caller's own — the id alone is not authority
+    // to generate an onboarding link into someone else's Stripe account.
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('user_id')
+      .eq('user_id', req.user.id)
+      .eq('stripe_connect_account_id', accountId)
+      .maybeSingle();
+
+    if (!profile) {
+      return res.status(403).json({ error: 'That account is not linked to you.' });
+    }
+
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: refreshUrl || `${process.env.FRONTEND_URL}/settings?stripe_refresh=true`,
+      return_url: returnUrl || `${process.env.FRONTEND_URL}/settings?stripe_return=true`,
+      type: 'account_onboarding',
+    });
+
+    res.json({ onboardingUrl: accountLink.url });
+  } catch (error) {
+    console.error('create-account-link failed:', error);
+    res.status(500).json({ error: 'Could not create an onboarding link.' });
   }
 });
 
@@ -428,9 +489,44 @@ async function handleStripeEvent(event) {
       await upsertSubscriptionRow(userId, sub, sub.customer);
       break;
     }
+    case 'payment_intent.succeeded': {
+      // Only our own top-ups; a PaymentIntent created for anything else must
+      // not turn into credits.
+      if (sub.metadata?.type !== 'credit_topup') return;
+      const userId = sub.metadata?.userId;
+      if (!userId) return;
+      await grantTopUpCredits(userId, sub.amount_received ?? sub.amount, sub.id);
+      break;
+    }
     default:
       break;
   }
+}
+
+/**
+ * Turn a succeeded PaymentIntent into wallet credits, exactly once.
+ *
+ * `amountInCents` comes from Stripe rather than from the caller — the amount
+ * granted has to be the amount actually captured, not what anyone claims it
+ * was. credit_wallet_topup() is keyed on the PaymentIntent id, so calling this
+ * twice (webhook plus inline confirmation) credits once.
+ */
+async function grantTopUpCredits(userId, amountInCents, paymentIntentId) {
+  const amount = Math.round(Number(amountInCents)) / 100;
+
+  const { data, error } = await supabase.rpc('credit_wallet_topup', {
+    p_user_id: userId,
+    p_amount: amount,
+    p_payment_intent: paymentIntentId,
+  });
+
+  if (error) {
+    console.error('credit_wallet_topup failed:', paymentIntentId, error.message);
+    throw error;
+  }
+
+  console.log('top-up:', paymentIntentId, data?.status, 'balance', data?.balance);
+  return data;
 }
 
 async function upsertSubscriptionRow(userId, subscription, customerId) {
@@ -804,6 +900,86 @@ app.post('/agora/token', verifyToken, async (req, res) => {
   }
 });
 
+// ── Credit top-ups ─────────────────────────────────────────────────────────
+// Buying credits is the only way money enters the wallet, and the wallet is
+// what pays for calls and stream entry, so the amount is decided here and
+// confirmed against Stripe — never taken from the client.
+app.post('/stripe/create-payment-intent', verifyToken, async (req, res) => {
+  try {
+    const amount = Number(req.body?.amount);
+
+    if (!Number.isFinite(amount) || amount < TOPUP_MIN || amount > TOPUP_MAX) {
+      return res.status(400).json({
+        error: `Enter an amount between $${TOPUP_MIN} and $${TOPUP_MAX}.`,
+      });
+    }
+
+    // The user id comes from the verified JWT, not the body: a PaymentIntent
+    // must never be able to credit somebody else's wallet.
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: 'usd',
+      // Explicit card-only, matching the client's confirmCardPayment() with a
+      // CardElement. automatic_payment_methods would offer methods that flow
+      // cannot confirm.
+      payment_method_types: ['card'],
+      metadata: {
+        type: 'credit_topup',
+        userId: req.user.id,
+      },
+    });
+
+    res.json({
+      client_secret: paymentIntent.client_secret,
+      payment_intent_id: paymentIntent.id,
+    });
+  } catch (error) {
+    console.error('create-payment-intent failed:', error);
+    res.status(500).json({ error: 'Could not start this payment.' });
+  }
+});
+
+// Called by the client the moment confirmCardPayment() resolves, so credits
+// appear immediately instead of whenever the webhook lands. The webhook is
+// still the safety net for a tab closed mid-payment; both funnel into the same
+// idempotent grant, so whichever is second changes nothing.
+app.post('/stripe/confirm-topup', verifyToken, async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body || {};
+    if (!paymentIntentId || typeof paymentIntentId !== 'string') {
+      return res.status(400).json({ error: 'paymentIntentId required' });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    // Stripe is asked directly whether this succeeded. The client saying so is
+    // not evidence.
+    if (paymentIntent.status !== 'succeeded') {
+      return res.status(400).json({ error: 'That payment has not completed.' });
+    }
+    if (paymentIntent.metadata?.type !== 'credit_topup') {
+      return res.status(400).json({ error: 'That payment was not a credit top-up.' });
+    }
+    if (paymentIntent.metadata?.userId !== req.user.id) {
+      return res.status(403).json({ error: 'That payment belongs to another account.' });
+    }
+
+    const result = await grantTopUpCredits(
+      req.user.id,
+      paymentIntent.amount_received ?? paymentIntent.amount,
+      paymentIntent.id
+    );
+
+    res.json({
+      status: result?.status || 'credited',
+      balance: Number(result?.balance) || 0,
+    });
+  } catch (error) {
+    console.error('confirm-topup failed:', error);
+    res.status(500).json({ error: 'Payment went through but credits could not be added. Contact support.' });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', service: 'talk-profit-link-backend' });
@@ -812,7 +988,10 @@ app.get('/health', (req, res) => {
 app.listen(port, () => {
   console.log(`🚀 Talk Profit Link backend running on port ${port}`);
   console.log('📊 Endpoints:');
+  console.log('  POST /stripe/create-payment-intent');
+  console.log('  POST /stripe/confirm-topup');
   console.log('  POST /stripe/create-express-account');
+  console.log('  POST /stripe/create-account-link');
   console.log('  POST /stripe/account-status');
   console.log('  POST /stripe/process-withdrawal');
   console.log('  POST /stripe/create-subscription-checkout');
