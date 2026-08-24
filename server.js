@@ -1016,6 +1016,61 @@ app.post('/stripe/confirm-topup', verifyToken, async (req, res) => {
   }
 });
 
+// Credit any succeeded top-up this user has paid for but not been given.
+//
+// A charge can land without the credits following it: the confirmation call
+// can fail after Stripe captured the money, and until the webhook secret is
+// configured there is no retry behind it. Rather than have anyone dig a
+// PaymentIntent id out of the dashboard, this finds their paid-but-uncredited
+// intents and puts them through the same idempotent grant. Safe to run any
+// number of times — already-credited intents report themselves and move no
+// money.
+app.post('/stripe/recover-topups', verifyToken, async (req, res) => {
+  try {
+    const intents = await stripe.paymentIntents.list({ limit: 100 });
+
+    const mine = intents.data.filter(
+      (pi) =>
+        pi.status === 'succeeded' &&
+        pi.metadata?.type === 'credit_topup' &&
+        pi.metadata?.userId === req.user.id
+    );
+
+    const results = [];
+    for (const pi of mine) {
+      try {
+        const granted = await grantTopUpCredits(
+          req.user.id,
+          pi.amount_received ?? pi.amount,
+          pi.id
+        );
+        results.push({
+          paymentIntentId: pi.id,
+          amount: (pi.amount_received ?? pi.amount) / 100,
+          status: granted?.status,
+          balance: granted?.balance,
+        });
+      } catch (err) {
+        // One failure must not hide the rest, and the reason is the whole
+        // point of this endpoint.
+        results.push({
+          paymentIntentId: pi.id,
+          amount: (pi.amount_received ?? pi.amount) / 100,
+          status: 'failed',
+          detail: err?.message || String(err),
+          code: err?.code || null,
+          hint: err?.hint || null,
+        });
+      }
+    }
+
+    res.json({ found: mine.length, results });
+  } catch (error) {
+    console.error('recover-topups failed:', error);
+    res.status(500).json({ error: error?.message || 'Could not check for uncredited payments.' });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', service: 'talk-profit-link-backend' });
@@ -1027,6 +1082,7 @@ app.listen(port, () => {
   console.log('📊 Endpoints:');
   console.log('  POST /stripe/create-payment-intent');
   console.log('  POST /stripe/confirm-topup');
+  console.log('  POST /stripe/recover-topups');
   console.log('  POST /stripe/create-express-account');
   console.log('  POST /stripe/create-account-link');
   console.log('  POST /stripe/account-status');
