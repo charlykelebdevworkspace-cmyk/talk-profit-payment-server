@@ -1,110 +1,44 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const twilio = require('twilio');
+const fetch = require('node-fetch');
 const { RtcTokenBuilder, RtcRole } = require('agora-token');
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const port = process.env.PORT || 3000;
 
+// Initialize Stripe
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// "Admin" client — uses whatever key is in SUPABASE_SERVICE_ROLE_KEY.
-// On Lovable projects without service-role access this is actually the anon
-// key, so it can ONLY do auth.getUser() and call SECURITY DEFINER functions.
-// Database reads/writes for user-owned data go through userClient(jwt) below.
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '';
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// Per-request client authenticated as the calling user. Use this for any DB
-// access that should obey RLS. Built once per request inside verifyToken.
-function userClient(userJwt) {
-  return createClient(SUPABASE_URL, SUPABASE_KEY, {
-    global: { headers: { Authorization: `Bearer ${userJwt}` } },
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-function decodeJwtRole(jwt) {
-  try {
-    const payload = jwt.split('.')[1];
-    const json = Buffer.from(payload, 'base64').toString('utf8');
-    return JSON.parse(json).role || '(no role claim)';
-  } catch {
-    return '(unparseable)';
-  }
-}
-
-async function logSupabaseDiagnostic() {
-  const projectRef = (SUPABASE_URL.match(/^https:\/\/([^.]+)\./) || [])[1] || '(none)';
-  const role = SUPABASE_KEY ? decodeJwtRole(SUPABASE_KEY) : '(missing)';
-  console.log(`Supabase URL: ${SUPABASE_URL || '(missing)'}  projectRef=${projectRef}  keyRole=${role}`);
-
-  if (role !== 'service_role') {
-    console.warn('Supabase key role is NOT service_role. Backend DB writes go through user JWTs (RLS) and the recording webhook is delegated to a Supabase Edge Function. Make sure the Edge Function "twilio-recording-webhook" is deployed.');
-  }
-}
-
+// Initialize Twilio
 const twilioClient = twilio(
   process.env.TWILIO_API_KEY,
   process.env.TWILIO_API_SECRET,
   { accountSid: process.env.TWILIO_ACCOUNT_SID }
 );
 
-// Agora powers livestreaming (Twilio Group Rooms cap at 50 participants).
-// APP_CERTIFICATE is what makes tokens meaningful — without it Agora accepts
-// anyone who knows the channel name, which for a paid stream is the whole farm.
-const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '';
-
 const STRIPE_RECORDING_PRICE_ID = process.env.STRIPE_RECORDING_PRICE_ID;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const STRIPE_WEBHOOK_SECRET_RECORDING = process.env.STRIPE_WEBHOOK_SECRET_RECORDING;
+const STRIPE_WEBHOOK_SECRET_SUBSCRIPTION = process.env.STRIPE_WEBHOOK_SECRET_SUBSCRIPTION;
 
-// Twilio status callbacks (room-ended, composition-available) are delivered to a
-// Supabase Edge Function so DB/storage writes can run with the auto-injected
-// service-role key. WEBHOOK_KEY is a shared secret stored on Railway and as a
-// Supabase Edge Function secret — Twilio passes it through as ?key=...
-function getRecordingCallbackUrl() {
-  if (!SUPABASE_URL || !/^https:\/\//i.test(SUPABASE_URL)) {
-    console.error('SUPABASE_URL missing/invalid — cannot build Twilio recording callback URL');
-    return null;
-  }
-  const key = process.env.WEBHOOK_KEY;
-  if (!key) {
-    console.error('WEBHOOK_KEY not set — cannot build Twilio recording callback URL');
-    return null;
-  }
-  return `${SUPABASE_URL.replace(/\/$/, '')}/functions/v1/twilio-recording-webhook?key=${encodeURIComponent(key)}`;
-}
+// Middleware
+// Configure CORS to handle preflight and allow required headers/methods
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.PREVIEW_ORIGIN
+].filter(Boolean);
 
-app.set('trust proxy', 1);
-
-app.use(helmet());
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: 'Too many requests, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use(limiter);
-
-const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: 'Too many payment attempts, please wait before trying again' },
-});
-
+// Helper to allow Lovable preview domains (*.lovable.app, *.lovableproject.com)
 const isLovablePreview = (origin) => {
   if (!origin) return false;
   try {
@@ -123,18 +57,12 @@ const isLovablePreview = (origin) => {
 
 const corsOptions = {
   origin: function (origin, callback) {
-    const allowedOrigins = [
-      'http://localhost:5173',
-      'http://localhost:3000',
-      'http://localhost:8080',
-      'https://talk-profit-link.vercel.app',
-      'https://yapski.com',
-      process.env.FRONTEND_URL,
-      process.env.PREVIEW_ORIGIN,
-      process.env.ALLOWED_ORIGIN,
-    ].filter(Boolean);
-
-    if (!origin || allowedOrigins.includes(origin) || isLovablePreview(origin)) {
+    // Allow non-browser requests (no origin), configured origins, and Lovable previews
+    if (
+      !origin ||
+      allowedOrigins.includes(origin) ||
+      isLovablePreview(origin)
+    ) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -143,12 +71,13 @@ const corsOptions = {
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 204,
+  optionsSuccessStatus: 204
 };
 
 app.use(cors(corsOptions));
 
-// Webhook routes must be before express.json() to get raw body for signature verification
+// IMPORTANT: webhook routes must be mounted BEFORE express.json() because
+// Stripe signature verification needs the raw body bytes.
 app.post(
   '/stripe/webhook',
   express.raw({ type: 'application/json' }),
@@ -158,7 +87,7 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         req.headers['stripe-signature'],
-        STRIPE_WEBHOOK_SECRET
+        STRIPE_WEBHOOK_SECRET_SUBSCRIPTION
       );
     } catch (err) {
       console.error('Stripe webhook signature failed:', err.message);
@@ -175,432 +104,235 @@ app.post(
   }
 );
 
-app.post(
-  '/stripe/webhook/recording',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    if (!STRIPE_WEBHOOK_SECRET_RECORDING) {
-      console.error('STRIPE_WEBHOOK_SECRET_RECORDING not configured');
-      return res.status(500).send('Webhook secret not configured');
-    }
-
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers['stripe-signature'],
-        STRIPE_WEBHOOK_SECRET_RECORDING
-      );
-    } catch (err) {
-      console.error('Stripe recording webhook signature failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    try {
-      await handleRecordingSubscriptionEvent(event);
-      res.json({ received: true });
-    } catch (err) {
-      console.error('Stripe recording webhook handler error:', err);
-      res.status(500).json({ error: 'webhook handler failed' });
-    }
-  }
-);
-
-// Legacy webhook path for backwards compatibility
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  if (!STRIPE_WEBHOOK_SECRET) {
-    console.warn('Webhook secret not configured - skipping verification');
-    return res.status(200).json({ received: true });
-  }
-
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).json({ error: 'Invalid webhook signature' });
-  }
-
-  try {
-    await handleStripeEvent(event);
-    res.json({ received: true });
-  } catch (err) {
-    console.error('Webhook handler error:', err);
-    res.status(500).json({ error: 'webhook handler failed' });
-  }
-});
-
-// Twilio recording status callbacks are now handled by the Supabase Edge
-// Function `twilio-recording-webhook`. Keep this route as a 410 in case any
-// stale Twilio rooms still try to deliver here, so we can see it in the logs.
+// Twilio webhook (form-encoded). Must run before express.json() but with
+// urlencoded parser so we can read the fields.
 app.post(
   '/twilio/recording-webhook',
   express.urlencoded({ extended: false }),
-  (req, res) => {
-    console.warn('[twilio-webhook] received on Railway (deprecated) event=%s roomSid=%s — should be hitting the Supabase Edge Function instead',
-      req.body?.StatusCallbackEvent,
-      req.body?.RoomSid);
-    res.status(410).send('Gone — use the Supabase Edge Function');
+  async (req, res) => {
+    try {
+      await handleTwilioRecordingEvent(req.body);
+      res.status(200).send('ok');
+    } catch (err) {
+      console.error('Twilio recording webhook error:', err);
+      res.status(500).send('error');
+    }
   }
 );
 
-app.use(express.json({ limit: '10mb' }));
+// Ensure Express handles JSON bodies (after raw-body webhooks above)
+app.use(express.json());
+// Explicitly handle all OPTIONS preflight requests
 app.options('*', cors(corsOptions));
 
+// Verify JWT token middleware
 const verifyToken = async (req, res, next) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
 
   try {
     const { data: { user }, error } = await supabase.auth.getUser(token);
-    if (error || !user) return res.status(401).json({ error: 'Invalid token' });
+    if (error || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
     req.user = user;
-    req.userToken = token;
-    req.supabase = userClient(token); // RLS-scoped DB client for this request
     next();
   } catch (error) {
     return res.status(401).json({ error: 'Token verification failed' });
   }
 };
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({
-    status: 'TalkProfit Payment Server Running',
-    version: '2.0.0',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development',
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy', service: 'talk-profit-payment-server' });
-});
-
-// Create Payment Intent (credit top-up)
-app.post('/create-payment-intent', paymentLimiter, async (req, res) => {
-  try {
-    const { amount, currency = 'usd', userId } = req.body;
-
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(500).json({ error: 'Payment service not configured' });
-    }
-    if (!amount || typeof amount !== 'number') {
-      return res.status(400).json({ error: 'Invalid amount format' });
-    }
-    if (amount < 100) return res.status(400).json({ error: 'Minimum amount is $1.00' });
-    if (amount > 100000) return res.status(400).json({ error: 'Maximum amount is $1000.00' });
-    if (!userId || typeof userId !== 'string') {
-      return res.status(400).json({ error: 'Valid user ID required' });
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency,
-      metadata: {
-        userId,
-        type: 'credit_topup',
-        timestamp: new Date().toISOString(),
-        source: 'talkprofit_web',
-      },
-      automatic_payment_methods: { enabled: true },
-      description: `TalkProfit Credit Top-up: $${(amount / 100).toFixed(2)}`,
-    });
-
-    res.json({
-      client_secret: paymentIntent.client_secret,
-      payment_intent_id: paymentIntent.id,
-    });
-  } catch (error) {
-    console.error('Error creating payment intent:', error);
-    if (error.code === 'api_key_invalid') {
-      return res.status(500).json({ error: 'Payment service configuration error' });
-    }
-    if (error.code === 'rate_limit') {
-      return res.status(429).json({ error: 'Service temporarily busy, please try again' });
-    }
-    res.status(500).json({
-      error: 'Unable to process payment request',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
-    });
-  }
-});
-
 // Create Stripe Connect Express account
-app.post('/stripe/create-express-account', paymentLimiter, async (req, res) => {
+app.post('/stripe/create-express-account', verifyToken, async (req, res) => {
   try {
     const { userId, email, returnUrl, refreshUrl } = req.body;
 
-    if (!email || typeof email !== 'string') {
-      return res.status(400).json({ error: 'Valid email required' });
-    }
-
+    // Create Stripe Express account
     const account = await stripe.accounts.create({
       type: 'express',
-      email,
+      email: email,
       capabilities: {
         card_payments: { requested: true },
         transfers: { requested: true },
       },
       business_type: 'individual',
-      metadata: { userId: userId || '' },
+      metadata: {
+        userId: userId
+      }
     });
 
-    // If returnUrl provided, also create the onboarding link in one call
-    if (returnUrl) {
-      const accountLink = await stripe.accountLinks.create({
-        account: account.id,
-        refresh_url: refreshUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
-        return_url: returnUrl,
-        type: 'account_onboarding',
-      });
-      return res.json({ accountId: account.id, onboardingUrl: accountLink.url });
-    }
-
-    res.json({ accountId: account.id, message: 'Express account created successfully' });
-  } catch (error) {
-    console.error('Error creating Express account:', error);
-    res.status(500).json({
-      error: 'Failed to create Express account',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
-    });
-  }
-});
-
-// Create account onboarding link (separate step)
-app.post('/stripe/create-account-link', paymentLimiter, async (req, res) => {
-  try {
-    const { accountId, returnUrl, refreshUrl } = req.body;
-
-    if (!accountId || typeof accountId !== 'string') {
-      return res.status(400).json({ error: 'Valid account ID required' });
-    }
-
-    try {
-      await stripe.accounts.retrieve(accountId);
-    } catch (accountError) {
-      return res.status(400).json({
-        error: 'Invalid Stripe Connect account',
-        message: 'The account ID provided is not valid or no longer exists',
-      });
-    }
-
+    // Create account link for onboarding
     const accountLink = await stripe.accountLinks.create({
-      account: accountId,
-      refresh_url: refreshUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
-      return_url: returnUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
+      account: account.id,
+      refresh_url: refreshUrl,
+      return_url: returnUrl,
       type: 'account_onboarding',
     });
 
-    res.json({ onboardingUrl: accountLink.url, message: 'Account link created successfully' });
-  } catch (error) {
-    console.error('Error creating account link:', error);
-    if (error.code === 'account_invalid') {
-      return res.status(400).json({ error: 'Invalid account' });
-    }
-    res.status(500).json({
-      error: 'Failed to create account link',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Unable to create onboarding link',
+    res.json({
+      accountId: account.id,
+      onboardingUrl: accountLink.url
     });
+  } catch (error) {
+    console.error('Error creating Express account:', error);
+    res.status(500).json({ error: 'Failed to create account' });
   }
 });
 
 // Get account status
-app.post('/stripe/account-status', async (req, res) => {
+app.post('/stripe/account-status', verifyToken, async (req, res) => {
   try {
     const { accountId } = req.body;
 
-    if (!accountId || typeof accountId !== 'string') {
-      return res.status(400).json({ error: 'Valid account ID required' });
-    }
-
     const account = await stripe.accounts.retrieve(accountId);
-    const isOnboarded = account.details_submitted && account.charges_enabled && account.payouts_enabled;
+    
+    const isOnboarded = account.details_submitted && 
+                       account.charges_enabled && 
+                       account.payouts_enabled;
+    
     const isEnabled = account.charges_enabled && account.payouts_enabled;
 
     let onboardingUrl = null;
     if (!isOnboarded) {
-      try {
-        const accountLink = await stripe.accountLinks.create({
-          account: accountId,
-          refresh_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_refresh=true`,
-          return_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/settings?stripe_return=true`,
-          type: 'account_onboarding',
-        });
-        onboardingUrl = accountLink.url;
-      } catch (linkError) {
-        console.error('Error creating account link:', linkError);
-      }
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: `${process.env.FRONTEND_URL}/settings?stripe_refresh=true`,
+        return_url: `${process.env.FRONTEND_URL}/settings?stripe_return=true`,
+        type: 'account_onboarding',
+      });
+      onboardingUrl = accountLink.url;
     }
 
     res.json({
       isOnboarded,
       isEnabled,
       onboardingUrl,
-      requiresAction: account.requirements.currently_due.length > 0,
-      currentlyDue: account.requirements.currently_due,
-      message: 'Account status retrieved successfully',
+      requiresAction: account.requirements.currently_due.length > 0
     });
   } catch (error) {
     console.error('Error getting account status:', error);
-    res.status(500).json({
-      error: 'Failed to get account status',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
-    });
-  }
-});
-
-// Get Stripe platform balance
-app.get('/stripe/balance', async (req, res) => {
-  try {
-    const balance = await stripe.balance.retrieve();
-
-    const available = balance.available.map(b => ({
-      amount: b.amount / 100,
-      currency: b.currency.toUpperCase(),
-    }));
-    const pending = balance.pending.map(b => ({
-      amount: b.amount / 100,
-      currency: b.currency.toUpperCase(),
-    }));
-
-    res.json({ available, pending, message: 'Balance retrieved successfully' });
-  } catch (error) {
-    console.error('Error fetching balance:', error);
-    res.status(500).json({
-      error: 'Failed to fetch balance',
-      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
-    });
+    res.status(500).json({ error: 'Failed to get account status' });
   }
 });
 
 // Process withdrawal
-app.post('/stripe/process-withdrawal', paymentLimiter, async (req, res) => {
+app.post('/stripe/process-withdrawal', verifyToken, async (req, res) => {
   try {
-    const { withdrawalRequestId, accountId, amount, transferGroup } = req.body;
+    const { withdrawalRequestId, accountId, amount } = req.body;
+    const userId = req.user.id;
 
-    if (!accountId || typeof accountId !== 'string') {
-      return res.status(400).json({ error: 'Valid account ID required' });
-    }
-    if (!amount || typeof amount !== 'number' || amount <= 0) {
-      return res.status(400).json({ error: 'Valid amount required' });
-    }
-
+    // Convert amount to cents for Stripe
     const amountInCents = Math.round(amount * 100);
-    if (amountInCents < 100) {
-      return res.status(400).json({ error: 'Minimum withdrawal amount is $1.00' });
-    }
 
-    // New flow: withdrawalRequestId provided — manage DB state in backend
-    if (withdrawalRequestId) {
-      const token = req.headers.authorization?.replace('Bearer ', '');
-      let userId = null;
-      if (token) {
-        const { data: { user } } = await supabase.auth.getUser(token);
-        userId = user?.id;
-      }
-
-      try {
-        const { data: withdrawalRequest, error: fetchError } = await supabase
-          .from('withdrawal_requests')
-          .select('*')
-          .eq('id', withdrawalRequestId)
-          .eq('status', 'pending')
-          .single();
-
-        if (fetchError || !withdrawalRequest) throw new Error('Invalid withdrawal request');
-
-        const { data: wallet, error: walletError } = await supabase
-          .from('wallets')
-          .select('earnings')
-          .eq('user_id', withdrawalRequest.user_id)
-          .single();
-
-        if (walletError || !wallet || wallet.earnings < amount) throw new Error('Insufficient earnings');
-
-        await supabase
-          .from('withdrawal_requests')
-          .update({ status: 'processing' })
-          .eq('id', withdrawalRequestId);
-
-        const transfer = await stripe.transfers.create({
-          amount: amountInCents,
-          currency: 'usd',
-          destination: accountId,
-          metadata: { withdrawalRequestId, userId: withdrawalRequest.user_id },
-        });
-
-        await supabase
-          .from('wallets')
-          .update({ earnings: wallet.earnings - amount })
-          .eq('user_id', withdrawalRequest.user_id);
-
-        await supabase
-          .from('withdrawal_requests')
-          .update({ status: 'completed', stripe_transfer_id: transfer.id, processed_at: new Date().toISOString() })
-          .eq('id', withdrawalRequestId);
-
-        await supabase.from('transactions').insert({
-          from_user_id: withdrawalRequest.user_id,
-          to_user_id: null,
-          amount: -amount,
-          transaction_type: 'withdrawal',
-          description: `Withdrawal to Stripe Connect account: $${amount.toFixed(2)}`,
-        });
-
-        return res.json({ success: true, transferId: transfer.id, message: 'Withdrawal processed successfully' });
-      } catch (error) {
-        await supabase
-          .from('withdrawal_requests')
-          .update({ status: 'failed', failure_reason: error.message, processed_at: new Date().toISOString() })
-          .eq('id', withdrawalRequestId);
-        throw error;
-      }
-    }
-
-    // Legacy flow: no withdrawalRequestId — frontend manages DB state
+    // Start a Supabase transaction-like operation
     try {
+      // Check if withdrawal request exists and is pending
+      const { data: withdrawalRequest, error: fetchError } = await supabase
+        .from('withdrawal_requests')
+        .select('*')
+        .eq('id', withdrawalRequestId)
+        .eq('user_id', userId)
+        .eq('status', 'pending')
+        .single();
+
+      if (fetchError || !withdrawalRequest) {
+        throw new Error('Invalid withdrawal request');
+      }
+
+      // Check user's earnings balance
+      const { data: wallet, error: walletError } = await supabase
+        .from('wallets')
+        .select('earnings')
+        .eq('user_id', userId)
+        .single();
+
+      if (walletError || !wallet || wallet.earnings < amount) {
+        throw new Error('Insufficient earnings');
+      }
+
+      // Update withdrawal request to processing
+      await supabase
+        .from('withdrawal_requests')
+        .update({ status: 'processing' })
+        .eq('id', withdrawalRequestId);
+
+      // Create Stripe transfer
       const transfer = await stripe.transfers.create({
         amount: amountInCents,
         currency: 'usd',
         destination: accountId,
-        transfer_group: transferGroup,
-        metadata: { type: 'withdrawal', amount_dollars: amount.toFixed(2) },
+        metadata: {
+          withdrawalRequestId: withdrawalRequestId,
+          userId: userId
+        }
       });
 
-      return res.json({ success: true, transferId: transfer.id, amount, message: 'Withdrawal processed successfully' });
-    } catch (stripeError) {
-      if (stripeError.code === 'insufficient_funds' || stripeError.code === 'balance_insufficient') {
-        return res.status(202).json({
-          success: true,
-          pending: true,
-          amount,
-          message: 'Withdrawal request accepted and will be processed within 7-14 business days',
+      // Update user's earnings (subtract the withdrawn amount)
+      const newEarnings = wallet.earnings - amount;
+      await supabase
+        .from('wallets')
+        .update({ earnings: newEarnings })
+        .eq('user_id', userId);
+
+      // Update withdrawal request with success
+      await supabase
+        .from('withdrawal_requests')
+        .update({
+          status: 'completed',
+          stripe_transfer_id: transfer.id,
+          processed_at: new Date().toISOString()
+        })
+        .eq('id', withdrawalRequestId);
+
+      // Create transaction record
+      await supabase
+        .from('transactions')
+        .insert({
+          from_user_id: userId,
+          to_user_id: null, // External withdrawal
+          amount: -amount, // Negative for withdrawal
+          transaction_type: 'withdrawal',
+          description: `Withdrawal to Stripe Connect account: $${amount.toFixed(2)}`
         });
-      }
-      throw stripeError;
+
+      res.json({
+        success: true,
+        transferId: transfer.id,
+        message: 'Withdrawal processed successfully'
+      });
+
+    } catch (error) {
+      // Update withdrawal request with failure
+      await supabase
+        .from('withdrawal_requests')
+        .update({
+          status: 'failed',
+          failure_reason: error.message,
+          processed_at: new Date().toISOString()
+        })
+        .eq('id', withdrawalRequestId);
+
+      throw error;
     }
+
   } catch (error) {
     console.error('Error processing withdrawal:', error);
-    if (error.code === 'account_invalid') {
-      return res.status(400).json({ error: 'Invalid Stripe Connect account' });
-    }
-    res.status(500).json({
+    res.status(500).json({ 
       error: 'Failed to process withdrawal',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Please try again or contact support',
+      message: error.message 
     });
   }
 });
 
 // ============================================================
-// Call Recording Subscription
+// Call Recording subscription
 // ============================================================
 
-async function getOrCreateStripeCustomer(db, userId, email) {
-  // Read under the user's JWT so RLS allows it — the anon client can't see the
-  // row and would create a duplicate Stripe customer on every checkout.
-  const { data: existing } = await db
+async function getOrCreateStripeCustomer(userId, email) {
+  const { data: existing } = await supabase
     .from('subscriptions')
     .select('stripe_customer_id')
     .eq('user_id', userId)
@@ -617,13 +349,14 @@ async function getOrCreateStripeCustomer(db, userId, email) {
   return customer.id;
 }
 
+// Create checkout session for the $50/mo recording subscription
 app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) => {
   try {
     if (!STRIPE_RECORDING_PRICE_ID) {
       return res.status(500).json({ error: 'STRIPE_RECORDING_PRICE_ID not configured' });
     }
     const { successUrl, cancelUrl } = req.body;
-    const customerId = await getOrCreateStripeCustomer(req.supabase, req.user.id, req.user.email);
+    const customerId = await getOrCreateStripeCustomer(req.user.id, req.user.email);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -644,11 +377,10 @@ app.post('/stripe/create-subscription-checkout', verifyToken, async (req, res) =
   }
 });
 
+// Cancel an active recording subscription (at period end)
 app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
   try {
-    // Read under the user's JWT (RLS) — the anon client can't see this row and
-    // would make cancellation always return 404.
-    const { data: sub } = await req.supabase
+    const { data: sub } = await supabase
       .from('subscriptions')
       .select('stripe_subscription_id')
       .eq('user_id', req.user.id)
@@ -664,9 +396,10 @@ app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
       cancel_at_period_end: true,
     });
 
-    // The resulting customer.subscription.updated webhook syncs the DB row
-    // through the SECURITY DEFINER RPC, so no direct write is needed here (the
-    // anon client can't write the row anyway).
+    await supabase
+      .from('subscriptions')
+      .update({ cancel_at_period_end: true })
+      .eq('stripe_subscription_id', sub.stripe_subscription_id);
 
     res.json({ success: true, cancel_at_period_end: updated.cancel_at_period_end });
   } catch (error) {
@@ -675,64 +408,24 @@ app.post('/stripe/cancel-subscription', verifyToken, async (req, res) => {
   }
 });
 
-// ============================================================
-// Stripe webhook event handler
-// ============================================================
-
+// Stripe webhook handler, invoked from the raw-body route above
 async function handleStripeEvent(event) {
-  const obj = event.data.object;
-
+  const sub = event.data.object;
   switch (event.type) {
-    case 'payment_intent.succeeded':
-      console.log(`Payment succeeded: ${obj.id}`);
-      break;
-    case 'payment_intent.payment_failed':
-      console.log(`Payment failed: ${obj.id}`);
-      break;
     case 'checkout.session.completed': {
-      if (obj.mode !== 'subscription') return;
-      const userId = obj.metadata?.user_id;
+      if (sub.mode !== 'subscription') return;
+      const userId = sub.metadata?.user_id;
       if (!userId) return;
-      const subscription = await stripe.subscriptions.retrieve(obj.subscription);
-      await upsertSubscriptionRow(userId, subscription, obj.customer);
+      const subscription = await stripe.subscriptions.retrieve(sub.subscription);
+      await upsertSubscriptionRow(userId, subscription, sub.customer);
       break;
     }
     case 'customer.subscription.created':
     case 'customer.subscription.updated':
     case 'customer.subscription.deleted': {
-      const userId = obj.metadata?.user_id;
+      const userId = sub.metadata?.user_id;
       if (!userId) return;
-      await upsertSubscriptionRow(userId, obj, obj.customer);
-      break;
-    }
-    case 'transfer.updated': {
-      if (obj.status === 'paid') await handleTransferPaid(obj);
-      else if (obj.status === 'failed') await handleTransferFailed(obj);
-      break;
-    }
-    default:
-      break;
-  }
-}
-
-async function handleRecordingSubscriptionEvent(event) {
-  const obj = event.data.object;
-
-  switch (event.type) {
-    case 'checkout.session.completed': {
-      if (obj.mode !== 'subscription') return;
-      const userId = obj.metadata?.user_id;
-      if (!userId) return;
-      const subscription = await stripe.subscriptions.retrieve(obj.subscription);
-      await upsertSubscriptionRow(userId, subscription, obj.customer);
-      break;
-    }
-    case 'customer.subscription.created':
-    case 'customer.subscription.updated':
-    case 'customer.subscription.deleted': {
-      const userId = obj.metadata?.user_id;
-      if (!userId) return;
-      await upsertSubscriptionRow(userId, obj, obj.customer);
+      await upsertSubscriptionRow(userId, sub, sub.customer);
       break;
     }
     default:
@@ -741,106 +434,30 @@ async function handleRecordingSubscriptionEvent(event) {
 }
 
 async function upsertSubscriptionRow(userId, subscription, customerId) {
-  // The backend runs with the anon key (no service-role), so a direct
-  // supabase.from('subscriptions').upsert() is an anonymous request that RLS
-  // silently rejects — which is why paid subscriptions never showed up in the
-  // app. Write through a SECURITY DEFINER RPC that bypasses RLS instead.
-  const cust = typeof customerId === 'string' ? customerId : customerId?.id;
-  const { error } = await supabase.rpc('upsert_recording_subscription', {
-    p_user_id: userId,
-    p_product: subscription.metadata?.product || 'call_recording',
-    p_stripe_customer_id: cust ?? null,
-    p_stripe_subscription_id: subscription.id,
-    p_status: subscription.status,
-    p_current_period_end: subscription.current_period_end
-      ? new Date(subscription.current_period_end * 1000).toISOString()
-      : null,
-    p_cancel_at_period_end: !!subscription.cancel_at_period_end,
-  });
-
-  // Don't swallow the error: throwing makes the webhook return 500 so Stripe
-  // retries, instead of pretending the write succeeded.
-  if (error) {
-    console.error(
-      '[subscription-upsert] failed user=%s sub=%s status=%s: %s',
-      userId, subscription.id, subscription.status, error.message
+  await supabase
+    .from('subscriptions')
+    .upsert(
+      {
+        user_id: userId,
+        product: subscription.metadata?.product || 'call_recording',
+        stripe_customer_id: typeof customerId === 'string' ? customerId : customerId?.id,
+        stripe_subscription_id: subscription.id,
+        status: subscription.status,
+        current_period_end: subscription.current_period_end
+          ? new Date(subscription.current_period_end * 1000).toISOString()
+          : null,
+        cancel_at_period_end: !!subscription.cancel_at_period_end,
+      },
+      { onConflict: 'stripe_subscription_id' }
     );
-    throw error;
-  }
-  console.log(
-    '[subscription-upsert] ok user=%s sub=%s status=%s',
-    userId, subscription.id, subscription.status
-  );
-}
-
-async function handleTransferPaid(transfer) {
-  try {
-    const { data: withdrawalRequest, error: findError } = await supabase
-      .from('withdrawal_requests')
-      .select('*')
-      .eq('stripe_transfer_id', transfer.id)
-      .single();
-
-    if (findError || !withdrawalRequest) return;
-
-    await supabase
-      .from('withdrawal_requests')
-      .update({ status: 'completed', processed_at: new Date().toISOString() })
-      .eq('id', withdrawalRequest.id);
-
-    await supabase
-      .from('transactions')
-      .update({ description: `Withdrawal completed: $${withdrawalRequest.amount.toFixed(2)} (${transfer.id})` })
-      .eq('from_user_id', withdrawalRequest.user_id)
-      .eq('amount', -withdrawalRequest.amount)
-      .eq('transaction_type', 'withdrawal');
-  } catch (error) {
-    console.error('Error handling transfer.paid:', error);
-  }
-}
-
-async function handleTransferFailed(transfer) {
-  try {
-    const { data: withdrawalRequest, error: findError } = await supabase
-      .from('withdrawal_requests')
-      .select('*')
-      .eq('stripe_transfer_id', transfer.id)
-      .single();
-
-    if (findError || !withdrawalRequest) return;
-
-    const { data: wallet } = await supabase
-      .from('wallets')
-      .select('earnings')
-      .eq('user_id', withdrawalRequest.user_id)
-      .single();
-
-    if (wallet) {
-      await supabase
-        .from('wallets')
-        .update({ earnings: wallet.earnings + withdrawalRequest.amount })
-        .eq('user_id', withdrawalRequest.user_id);
-    }
-
-    await supabase
-      .from('withdrawal_requests')
-      .update({
-        status: 'failed',
-        failure_reason: transfer.failure_message || 'Transfer failed',
-        processed_at: new Date().toISOString(),
-      })
-      .eq('id', withdrawalRequest.id);
-  } catch (error) {
-    console.error('Error handling transfer.failed:', error);
-  }
 }
 
 // ============================================================
 // Twilio room creation + recording webhook
 // ============================================================
 
-async function userHasActiveRecordingSubscription(db, userId) {
-  const { data, error } = await db
+async function userHasActiveRecordingSubscription(userId) {
+  const { data } = await supabase
     .from('subscriptions')
     .select('id')
     .eq('user_id', userId)
@@ -848,363 +465,211 @@ async function userHasActiveRecordingSubscription(db, userId) {
     .in('status', ['active', 'trialing'])
     .limit(1)
     .maybeSingle();
-  if (error) console.warn('[subscription-check] error for user=%s: %s', userId, error.message);
   return !!data;
 }
-  app.post('/twilio/start-recording', verifyToken, async (req, res) => {
-    try {
-      const { callId } = req.body;
-      console.log('[start-recording] callId=%s user=%s', callId, req.user.id);
-      if (!callId) return res.status(400).json({ error: 'callId required' });
 
-      const db = req.supabase;
-
-      if (!(await userHasActiveRecordingSubscription(db, req.user.id))) {
-        console.warn('[start-recording] user=%s has no active call_recording subscription', req.user.id);
-        return res.status(403).json({ error: 'active call recording subscription required' });
-      }
-
-      const roomName = `call-${callId}`;
-      const callbackUrl = getRecordingCallbackUrl();
-      if (!callbackUrl) {
-        console.warn('[start-recording] SUPABASE_URL or WEBHOOK_KEY not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
-      }
-
-      let room;
-      try {
-        room = await twilioClient.video.v1.rooms(roomName).fetch();
-        console.log('[start-recording] existing room sid=%s status=%s type=%s', room.sid, room.status, room.type);
-      } catch (e) {
-        if (e?.status && e.status !== 404) {
-          console.error('[start-recording] rooms.fetch failed:', e.status, e.code, e.message);
-        }
-        room = null;
-      }
-
-      const createRecordingRoom = () =>
-        twilioClient.video.v1.rooms.create({
-          uniqueName: roomName,
-          type: 'group',
-          recordParticipantsOnConnect: true,
-          statusCallback: callbackUrl || undefined,
-          statusCallbackMethod: callbackUrl ? 'POST' : undefined,
-          // Generous enough to survive a full ring cycle and a brief reconnect.
-          // At 1 minute, a room pre-created when the call started would time out
-          // while the phone was still ringing; the answering client then joined
-          // a Twilio-auto-created peer-to-peer room and the call went unrecorded.
-          emptyRoomTimeout: 5,
-          unusedRoomTimeout: 5,
-        });
-
-      let recordingMode = 'created'; // 'created' | 'recreated' | 'rules-updated'
-      if (!room || room.status === 'completed') {
-        room = await createRecordingRoom();
-        console.log('[start-recording] created group room sid=%s callback=%s', room.sid, callbackUrl || '(none)');
-      } else if (room.type !== 'group' || room.recordParticipantsOnConnect === false) {
-        // The room exists but can't produce a usable recording: either it is
-        // peer-to-peer, or it was created without record-on-connect (recording
-        // rules do NOT retroactively record already-connected participants).
-        // If nobody has joined yet we can still fix it by replacing the room.
-        let connected = [];
-        try {
-          connected = await twilioClient.video.v1
-            .rooms(room.sid)
-            .participants.list({ status: 'connected', limit: 5 });
-        } catch (e) {
-          console.warn('[start-recording] participants.list failed:', e?.message);
-        }
-
-        if (connected.length > 0) {
-          return res.status(409).json({
-            error: 'Room already in progress without recording. End the call and start a new one to enable recording.',
-          });
-        }
-
-        console.warn('[start-recording] replacing non-recording room sid=%s type=%s record=%s',
-          room.sid, room.type, room.recordParticipantsOnConnect);
-        await twilioClient.video.v1.rooms(room.sid).update({ status: 'completed' });
-        room = await createRecordingRoom();
-        recordingMode = 'recreated';
-        console.log('[start-recording] recreated group room sid=%s', room.sid);
-      } else {
-        await twilioClient.video.v1.rooms(room.sid).recordingRules.update({
-          rules: [{ type: 'include', all: true }],
-        });
-        recordingMode = 'rules-updated';
-        console.log('[start-recording] updated recordingRules sid=%s — note: only participants who (re)connect after this point will be recorded', room.sid);
-      }
-
-      // Only set recording_subscriber_id if it isn't already set (first caller wins).
-      try {
-        const { data: existingCall, error: lookupErr } = await db
-          .from('calls')
-          .select('id, recording_subscriber_id, twilio_room_sid')
-          .eq('id', callId)
-          .maybeSingle();
-        if (lookupErr) console.warn('[start-recording] calls lookup error:', lookupErr.message);
-        if (!existingCall) {
-          console.warn('[start-recording] no calls row visible for callId=%s under user JWT — either the row does not exist or RLS blocks SELECT for this user. Recording cannot be linked.', callId);
-        }
-
-        const update = {
-          recording_enabled: true,
-          twilio_room_sid: room.sid,
-        };
-        if (!existingCall?.recording_subscriber_id) {
-          update.recording_subscriber_id = req.user.id;
-        }
-        const { data: updated, error: updErr } = await db
-          .from('calls')
-          .update(update)
-          .eq('id', callId)
-          .select('id, twilio_room_sid, recording_subscriber_id');
-        if (updErr) console.warn('[start-recording] calls update error:', updErr.message);
-        else console.log('[start-recording] calls update matched=%d row=%j', updated?.length || 0, updated?.[0] || null);
-      } catch (e) {
-        console.warn('[start-recording] calls update skipped:', e?.message);
-      }
-
-      res.json({ recording: true, roomSid: room.sid, mode: recordingMode });
-    } catch (error) {
-      console.error('[start-recording] failed:', error);
-      res.status(500).json({ error: error.message || 'failed to start recording' });
-    }
-  });
-
+// Pre-create a Twilio room with recording enabled if any call participant
+// has an active recording subscription. Both parties call this before joining
+// to ensure the room is created in the correct mode regardless of who joins first.
 app.post('/twilio/create-room', verifyToken, async (req, res) => {
-    try {
-      const { callId } = req.body;
-      if (!callId) return res.status(400).json({ error: 'callId required' });
-
-      const db = req.supabase;
-      const { data: callRow, error: lookupErr } = await db
-        .from('calls')
-        .select('id, caller_id, receiver_id, recording_enabled, twilio_room_sid')
-        .eq('id', callId)
-        .maybeSingle();
-      if (lookupErr) console.warn('[create-room] calls lookup error:', lookupErr.message);
-      if (!callRow) return res.status(404).json({ error: 'call not found' });
-      if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
-        return res.status(403).json({ error: 'not a call participant' });
-      }
-
-      // Subscription lookup uses the user JWT, so the requesting user can only
-      // see their own subscription row. That's fine for the common case where
-      // the caller is checking whether *they* enabled recording.
-      let subscriberId = null;
-      if (await userHasActiveRecordingSubscription(db, req.user.id)) {
-        subscriberId = req.user.id;
-      }
-
-      const roomName = `call-${callId}`;
-      const callbackUrl = getRecordingCallbackUrl();
-      if (subscriberId && !callbackUrl) {
-        console.warn('[create-room] SUPABASE_URL or WEBHOOK_KEY not configured — Twilio cannot deliver room-ended/composition callbacks. Recording will NOT be saved.');
-      }
-
-      let room;
-      try {
-        room = await twilioClient.video.v1.rooms(roomName).fetch();
-        console.log('[create-room] existing room sid=%s status=%s type=%s', room.sid, room.status, room.type);
-      } catch (e) {
-        if (e?.status && e.status !== 404) {
-          console.error('[create-room] rooms.fetch failed:', e.status, e.code, e.message);
-        }
-        room = null;
-      }
-
-      if (!room || room.status === 'completed') {
-        room = await twilioClient.video.v1.rooms.create({
-          uniqueName: roomName,
-          type: 'group',
-          recordParticipantsOnConnect: !!subscriberId,
-          statusCallback: callbackUrl || undefined,
-          statusCallbackMethod: callbackUrl ? 'POST' : undefined,
-          emptyRoomTimeout: 5,
-          unusedRoomTimeout: 5,
-        });
-        console.log('[create-room] created group room sid=%s record=%s callback=%s',
-          room.sid, !!subscriberId, callbackUrl || '(none)');
-      }
-
-      if (subscriberId && !callRow.recording_enabled) {
-        await db
-          .from('calls')
-          .update({ recording_enabled: true, recording_subscriber_id: subscriberId, twilio_room_sid: room.sid })
-          .eq('id', callId);
-      } else if (!callRow.twilio_room_sid) {
-        await db.from('calls').update({ twilio_room_sid: room.sid }).eq('id', callId);
-      }
-
-      res.json({ recording: !!subscriberId, roomCreated: true, roomSid: room.sid });
-    } catch (error) {
-      console.error('[create-room] failed:', error);
-      res.status(500).json({ error: 'failed to create room' });
-    }
-  });
-
-// Explicitly complete a room when the call hangs up — fires room-ended immediately
-// instead of waiting for Twilio's emptyRoomTimeout.
-app.post('/twilio/end-room', verifyToken, async (req, res) => {
   try {
     const { callId } = req.body;
     if (!callId) return res.status(400).json({ error: 'callId required' });
-    console.log('[end-room] callId=%s user=%s', callId, req.user.id);
 
-    const { data: callRow, error: lookupErr } = await req.supabase
+    const { data: callRow } = await supabase
       .from('calls')
-      .select('id, caller_id, receiver_id, twilio_room_sid')
+      .select('id, caller_id, receiver_id, recording_enabled, twilio_room_sid')
       .eq('id', callId)
-      .maybeSingle();
-    if (lookupErr) console.warn('[end-room] calls lookup error:', lookupErr.message);
+      .single();
     if (!callRow) return res.status(404).json({ error: 'call not found' });
     if (callRow.caller_id !== req.user.id && callRow.receiver_id !== req.user.id) {
       return res.status(403).json({ error: 'not a call participant' });
     }
-    if (!callRow.twilio_room_sid) {
-      console.log('[end-room] no twilio_room_sid on callId=%s — nothing to end', callId);
-      return res.json({ ended: false, reason: 'no room' });
-    }
 
-    try {
-      const updated = await twilioClient.video.v1
-        .rooms(callRow.twilio_room_sid)
-        .update({ status: 'completed' });
-      console.log('[end-room] completed room sid=%s status=%s', updated.sid, updated.status);
-      res.json({ ended: true, roomSid: updated.sid });
-    } catch (e) {
-      // Already completed is fine
-      if (e?.status === 400 || /already.*completed/i.test(e?.message || '')) {
-        console.log('[end-room] room already completed sid=%s', callRow.twilio_room_sid);
-        return res.json({ ended: true, alreadyCompleted: true });
+    // Find a subscriber among participants. Prefer the requester if they are one.
+    const candidates = [callRow.caller_id, callRow.receiver_id];
+    let subscriberId = null;
+    if (await userHasActiveRecordingSubscription(req.user.id)) {
+      subscriberId = req.user.id;
+    } else {
+      for (const uid of candidates) {
+        if (uid === req.user.id) continue;
+        if (await userHasActiveRecordingSubscription(uid)) {
+          subscriberId = uid;
+          break;
+        }
       }
-      console.error('[end-room] failed to complete room:', e?.status, e?.code, e?.message);
-      res.status(500).json({ error: e?.message || 'failed to end room' });
     }
+
+    if (!subscriberId) return res.json({ recording: false, roomCreated: false });
+
+    const roomName = `call-${callId}`;
+    let room;
+    try {
+      room = await twilioClient.video.v1.rooms(roomName).fetch();
+    } catch (_) {
+      room = null;
+    }
+
+    if (!room || room.status === 'completed') {
+      const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
+      room = await twilioClient.video.v1.rooms.create({
+        uniqueName: roomName,
+        type: 'group',
+        recordParticipantsOnConnect: true,
+        statusCallback: callbackUrl || undefined,
+        statusCallbackMethod: 'POST',
+      });
+    }
+
+    if (!callRow.recording_enabled) {
+      await supabase
+        .from('calls')
+        .update({
+          recording_enabled: true,
+          recording_subscriber_id: subscriberId,
+          twilio_room_sid: room.sid,
+        })
+        .eq('id', callId);
+    }
+
+    res.json({ recording: true, roomCreated: true, roomSid: room.sid });
   } catch (error) {
-    console.error('[end-room] failed:', error);
-    res.status(500).json({ error: error.message || 'failed to end room' });
+    console.error('create-room failed:', error);
+    res.status(500).json({ error: 'failed to create room' });
   }
 });
 
-// ============================================================
-// Agora livestreaming tokens
-// ============================================================
+// Twilio fires this when the room completes; build a composition then ingest it
+async function handleTwilioRecordingEvent(body) {
+  const event = body.StatusCallbackEvent;
+  const roomSid = body.RoomSid;
+  if (!roomSid) return;
 
-// Agora uids are 32-bit unsigned ints, but our identities are UUIDs. Derive a
-// stable uid per (user, stream) so a reconnect keeps the same uid and the token
-// stays valid. FNV-1a, masked to 31 bits to stay clear of the sign bit and 0
-// (0 means "let Agora assign one", which would not match the signed token).
-function agoraUid(userId, streamId) {
-  let hash = 0x811c9dc5;
-  const input = `${userId}:${streamId}`;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return (hash & 0x7fffffff) || 1;
-}
-
-// Mint a channel token. The ROLE IS DECIDED HERE, not by the client: host and
-// accepted guests publish, everyone else is subscribe-only. This is also where
-// a paid-entry check belongs once prices go live — the token is the paywall.
-app.post('/agora/token', verifyToken, async (req, res) => {
-  try {
-    const { streamId } = req.body;
-    if (!streamId) return res.status(400).json({ error: 'streamId required' });
-
-    if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
-      console.error('[agora-token] AGORA_APP_ID / AGORA_APP_CERTIFICATE not configured');
-      return res.status(500).json({ error: 'livestreaming not configured' });
-    }
-
-    const db = req.supabase;
-    const { data: stream, error: lookupErr } = await db
-      .from('streams')
-      .select('id, host_id, status, last_seen_at')
-      .eq('id', streamId)
+  if (event === 'room-ended') {
+    const { data: callRow } = await supabase
+      .from('calls')
+      .select('id, recording_subscriber_id, call_type')
+      .eq('twilio_room_sid', roomSid)
       .maybeSingle();
-    if (lookupErr) console.warn('[agora-token] stream lookup error:', lookupErr.message);
-    if (!stream) return res.status(404).json({ error: 'stream not found' });
+    if (!callRow || !callRow.recording_subscriber_id) return;
 
-    const isHost = stream.host_id === req.user.id;
+    const callbackUrl = `${process.env.PUBLIC_BACKEND_URL || ''}/twilio/recording-webhook`;
 
-    if (!isHost && stream.status !== 'live') {
-      return res.status(409).json({ error: 'stream has ended' });
-    }
+    const composition = await twilioClient.video.v1.compositions.create({
+      roomSid,
+      audioSources: ['*'],
+      videoLayout:
+        callRow.call_type === 'video'
+          ? { grid: { video_sources: ['*'] } }
+          : undefined,
+      // Portrait frame so the grid layout stacks the two participants
+      // top/bottom (matching the mobile call UI) instead of side by side,
+      // which is what grid does in the default landscape 640x480 frame.
+      resolution: callRow.call_type === 'video' ? '720x1280' : undefined,
+      format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
+      statusCallback: callbackUrl || undefined,
+      statusCallbackMethod: 'POST',
+    });
 
-    // Publishers: the host, plus any guest they have pulled up on stage.
-    let canPublish = isHost;
-    if (!canPublish) {
-      const { data: guest } = await db
-        .from('stream_guests')
-        .select('status')
-        .eq('stream_id', streamId)
-        .eq('user_id', req.user.id)
-        .maybeSingle();
-      canPublish = guest?.status === 'accepted';
-    }
-
-    // A kicked viewer must not be able to rejoin by asking for a new token.
-    if (!canPublish) {
-      const { data: viewer } = await db
-        .from('stream_viewers')
-        .select('kicked')
-        .eq('stream_id', streamId)
-        .eq('user_id', req.user.id)
-        .maybeSingle();
-      if (viewer?.kicked) return res.status(403).json({ error: 'removed from this stream' });
-    }
-
-    const channel = `stream-${streamId}`;
-    const uid = agoraUid(req.user.id, streamId);
-    const role = canPublish ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
-    const ttlSeconds = 60 * 60 * 4; // 4h, comfortably longer than a show
-    const expireAt = Math.floor(Date.now() / 1000) + ttlSeconds;
-
-    const token = RtcTokenBuilder.buildTokenWithUid(
-      AGORA_APP_ID,
-      AGORA_APP_CERTIFICATE,
-      channel,
-      uid,
-      role,
-      expireAt,
-      expireAt,
-    );
-
-    console.log('[agora-token] stream=%s user=%s uid=%d role=%s',
-      streamId, req.user.id, uid, canPublish ? 'publisher' : 'subscriber');
-
-    res.json({ appId: AGORA_APP_ID, channel, token, uid, canPublish, expiresAt: expireAt });
-  } catch (error) {
-    console.error('[agora-token] failed:', error);
-    res.status(500).json({ error: 'failed to mint token' });
+    await supabase.from('call_recordings').insert({
+      call_id: callRow.id,
+      subscriber_user_id: callRow.recording_subscriber_id,
+      twilio_composition_sid: composition.sid,
+      storage_path: '',
+      media_format: callRow.call_type === 'video' ? 'mp4' : 'mp3',
+      call_type: callRow.call_type,
+      status: 'processing',
+    });
+    return;
   }
-});
+
+  if (event === 'composition-available') {
+    const compositionSid = body.CompositionSid;
+    if (!compositionSid) return;
+
+    const { data: rec } = await supabase
+      .from('call_recordings')
+      .select('id, subscriber_user_id, call_id, media_format')
+      .eq('twilio_composition_sid', compositionSid)
+      .maybeSingle();
+    if (!rec) return;
+
+    const composition = await twilioClient.video.v1.compositions(compositionSid).fetch();
+    const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
+
+    const mediaResp = await fetch(mediaUrl, {
+      headers: {
+        Authorization:
+          'Basic ' +
+          Buffer.from(
+            `${process.env.TWILIO_API_KEY}:${process.env.TWILIO_API_SECRET}`
+          ).toString('base64'),
+      },
+      redirect: 'follow',
+    });
+    if (!mediaResp.ok) {
+      console.error('Failed to fetch composition media:', mediaResp.status);
+      return;
+    }
+    const buffer = await mediaResp.buffer();
+
+    const ext = rec.media_format;
+    const path = `${rec.subscriber_user_id}/${rec.call_id}.${ext}`;
+    const { error: uploadErr } = await supabase.storage
+      .from('recordings')
+      .upload(path, buffer, {
+        contentType: ext === 'mp4' ? 'video/mp4' : 'audio/mpeg',
+        upsert: true,
+      });
+    if (uploadErr) {
+      console.error('Failed to upload recording to storage:', uploadErr);
+      return;
+    }
+
+    await supabase
+      .from('call_recordings')
+      .update({
+        storage_path: path,
+        size_bytes: buffer.length,
+        duration_seconds: composition.duration || null,
+        status: 'ready',
+      })
+      .eq('id', rec.id);
+
+    // Best-effort cleanup of the source composition + room recordings on Twilio
+    try {
+      await twilioClient.video.v1.compositions(compositionSid).remove();
+    } catch (e) {
+      console.warn('Failed to remove composition:', e.message);
+    }
+  }
+}
 
 // Signed download URL for a recording (subscriber-only)
 app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
   try {
-    const { data: rec, error: lookupErr } = await req.supabase
+    const { data: rec } = await supabase
       .from('call_recordings')
       .select('id, subscriber_user_id, storage_path, status')
       .eq('id', req.params.id)
       .maybeSingle();
-    if (lookupErr) console.warn('[signed-url] lookup error:', lookupErr.message);
 
     if (!rec) return res.status(404).json({ error: 'not found' });
-    if (rec.subscriber_user_id !== req.user.id) return res.status(403).json({ error: 'forbidden' });
-    if (!(await userHasActiveRecordingSubscription(req.supabase, req.user.id))) {
-      console.warn('[signed-url] user=%s no active call_recording subscription', req.user.id);
-      return res.status(403).json({ error: 'active call recording subscription required' });
+    if (rec.subscriber_user_id !== req.user.id) {
+      return res.status(403).json({ error: 'forbidden' });
     }
     if (rec.status !== 'ready' || !rec.storage_path) {
       return res.status(409).json({ error: 'recording not ready' });
     }
 
-    const { data, error } = await req.supabase.storage
+    // `download: true` sets Content-Disposition: attachment on the signed URL so
+    // the browser downloads the file instead of playing it inline. This is what
+    // makes downloads work on mobile Safari, where the client-side `download`
+    // attribute is ignored for cross-origin URLs.
+    const { data, error } = await supabase.storage
       .from('recordings')
-      .createSignedUrl(rec.storage_path, 60 * 10);
+      .createSignedUrl(rec.storage_path, 60 * 10, { download: true }); // 10-minute URL
     if (error) throw error;
 
     res.json({ url: data.signedUrl });
@@ -1214,113 +679,150 @@ app.get('/recordings/:id/signed-url', verifyToken, async (req, res) => {
   }
 });
 
-// ============================================================
-// Admin: backfill subscriptions from Stripe into the DB.
-// One-off repair for users who paid while the webhook write was broken.
-// Protected by a shared secret (ADMIN_KEY, falls back to WEBHOOK_KEY).
-// Call: POST /admin/backfill-subscriptions  header  x-admin-key: <secret>
-// ============================================================
-app.post('/admin/backfill-subscriptions', async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY || process.env.WEBHOOK_KEY;
-  if (!adminKey) {
-    return res.status(500).json({ error: 'ADMIN_KEY/WEBHOOK_KEY not configured' });
-  }
-  const provided = req.headers['x-admin-key'] || req.body?.key;
-  if (provided !== adminKey) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+// ── Livestreams ────────────────────────────────────────────────────────────
+// The Agora token is the paywall. Roles and entitlement are decided here and
+// signed into the token, so nothing the client says about itself matters: a
+// viewer cannot promote themselves to publisher, a kicked viewer cannot
+// refresh their way back in, and someone who skipped the charge is never given
+// a token at all. The database gate (RLS on stream_viewers) stops them
+// registering; this stops them receiving media.
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
 
-  const result = { processed: 0, upserted: 0, skipped_no_user_id: 0, failed: 0 };
+// Long enough to sit through a show, and renewed from the client before it
+// lapses (see token-privilege-will-expire in src/lib/agoraService.ts) so a
+// viewer who paid is never dropped mid-stream.
+const AGORA_TOKEN_TTL_SECONDS = 4 * 60 * 60;
+
+// Agora uids are 32-bit unsigned ints, not uuids. Derive one deterministically
+// from the user id so the same person always reconnects as the same uid —
+// otherwise every rejoin would look like a new participant. 0 is reserved by
+// the SDK for "assign me one", so it is never returned.
+const agoraUidFor = (userId) => {
+  let hash = 5381;
+  for (let i = 0; i < userId.length; i++) {
+    hash = ((hash * 33) ^ userId.charCodeAt(i)) >>> 0;
+  }
+  return hash === 0 ? 1 : hash;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+app.post('/agora/token', verifyToken, async (req, res) => {
   try {
-    // Walk every subscription in the Stripe account (all statuses) and sync the
-    // row using the same SECURITY DEFINER RPC the webhook uses.
-    for await (const subscription of stripe.subscriptions.list({
-      status: 'all',
-      limit: 100,
-      expand: ['data.customer'],
-    })) {
-      result.processed++;
-      const userId = subscription.metadata?.user_id;
-      if (!userId) {
-        result.skipped_no_user_id++;
-        console.warn('[backfill] subscription %s has no user_id metadata — skipped', subscription.id);
-        continue;
+    if (!AGORA_APP_ID || !AGORA_APP_CERTIFICATE) {
+      console.error('agora token requested but AGORA_APP_ID/AGORA_APP_CERTIFICATE are not set');
+      return res.status(500).json({ error: 'Live streaming is not configured.' });
+    }
+
+    const { streamId } = req.body;
+    if (!streamId || !UUID_RE.test(streamId)) {
+      return res.status(400).json({ error: "This stream link isn't valid." });
+    }
+
+    const userId = req.user.id;
+
+    const { data: stream } = await supabase
+      .from('streams')
+      .select('id, host_id, price, status, last_seen_at')
+      .eq('id', streamId)
+      .maybeSingle();
+
+    if (!stream) return res.status(404).json({ error: "This stream doesn't exist." });
+
+    // Same freshness rule as is_stream_joinable(): a host who closed the tab
+    // never wrote status='ended', but the show is over all the same.
+    const stale = Date.now() - new Date(stream.last_seen_at).getTime() > 2 * 60 * 1000;
+    if (stream.status !== 'live' || stale) {
+      return res.status(410).json({ error: 'This stream has ended.' });
+    }
+
+    const isHost = stream.host_id === userId;
+    let canPublish = isHost;
+
+    if (!isHost) {
+      const { data: viewer } = await supabase
+        .from('stream_viewers')
+        .select('kicked')
+        .eq('stream_id', streamId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (viewer?.kicked) {
+        return res.status(403).json({ error: 'You were removed from this stream.' });
       }
-      try {
-        await upsertSubscriptionRow(userId, subscription, subscription.customer);
-        result.upserted++;
-      } catch (err) {
-        result.failed++;
-        console.error('[backfill] upsert failed for sub %s: %s', subscription.id, err.message);
+
+      // An accepted co-host publishes, and is never charged: they are part of
+      // the show rather than its audience.
+      const { data: guest } = await supabase
+        .from('stream_guests')
+        .select('status')
+        .eq('stream_id', streamId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      canPublish = guest?.status === 'accepted';
+
+      if (!canPublish) {
+        // Entry is a ticket row, written only by pay_stream_entry(). Free
+        // streams issue one too, so there is a single code path here and the
+        // answer never depends on re-reading the price.
+        const { data: entry } = await supabase
+          .from('stream_entries')
+          .select('id')
+          .eq('stream_id', streamId)
+          .eq('user_id', userId)
+          .maybeSingle();
+
+        if (!entry) {
+          return res.status(402).json({
+            error: 'Entry payment required for this stream.',
+            price: Number(stream.price) || 0,
+          });
+        }
       }
     }
-    console.log('[backfill] done', result);
-    res.json({ success: true, ...result });
+
+    const uid = agoraUidFor(userId);
+    const channel = `stream-${streamId}`;
+    const expire = Math.floor(Date.now() / 1000) + AGORA_TOKEN_TTL_SECONDS;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channel,
+      uid,
+      canPublish ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER,
+      AGORA_TOKEN_TTL_SECONDS,
+      AGORA_TOKEN_TTL_SECONDS
+    );
+
+    res.json({ appId: AGORA_APP_ID, channel, token, uid, canPublish, expiresAt: expire });
   } catch (error) {
-    console.error('[backfill] failed:', error);
-    res.status(500).json({ error: 'backfill failed', ...result });
+    console.error('agora token failed:', error);
+    res.status(500).json({ error: 'Could not join this stream.' });
   }
 });
 
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({
-    error: 'Endpoint not found',
-    available_endpoints: [
-      'GET /',
-      'GET /health',
-      'GET /stripe/balance',
-      'GET /recordings/:id/signed-url',
-      'POST /create-payment-intent',
-      'POST /stripe/create-express-account',
-      'POST /stripe/create-account-link',
-      'POST /stripe/account-status',
-      'POST /stripe/process-withdrawal',
-      'POST /stripe/create-subscription-checkout',
-      'POST /stripe/cancel-subscription',
-      'POST /admin/backfill-subscriptions',
-      'POST /stripe/webhook',
-      'POST /webhook',
-      'POST /twilio/create-room',
-      'POST /twilio/start-recording',
-      'POST /twilio/end-room',
-      'POST /twilio/recording-webhook',
-    ],
-  });
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', service: 'talk-profit-link-backend' });
 });
 
-app.use((error, req, res, next) => {
-  console.error('Server error:', error);
-  res.status(500).json({
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong',
-  });
-});
-
-process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down gracefully'); process.exit(0); });
-process.on('SIGINT', () => { console.log('SIGINT received, shutting down gracefully'); process.exit(0); });
-
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`TalkProfit Payment Server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Stripe configured: ${process.env.STRIPE_SECRET_KEY ? 'yes' : 'no'}`);
-  console.log(`Twilio configured: ${process.env.TWILIO_API_KEY ? 'yes' : 'no'}`);
-  const cb = getRecordingCallbackUrl();
-  if (cb) {
-    console.log(`Twilio recording callback: ${cb}`);
-  } else {
-    console.warn('Twilio recording callback: DISABLED — set PUBLIC_BACKEND_URL to a publicly reachable https URL (e.g. https://your-app.up.railway.app) or compositions will never be created.');
-  }
-  logSupabaseDiagnostic();
-});
-
-server.on('error', (error) => {
-  if (error.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use`);
-    process.exit(1);
-  } else {
-    throw error;
-  }
+app.listen(port, () => {
+  console.log(`🚀 Talk Profit Link backend running on port ${port}`);
+  console.log('📊 Endpoints:');
+  console.log('  POST /stripe/create-express-account');
+  console.log('  POST /stripe/account-status');
+  console.log('  POST /stripe/process-withdrawal');
+  console.log('  POST /stripe/create-subscription-checkout');
+  console.log('  POST /stripe/cancel-subscription');
+  console.log('  POST /stripe/webhook');
+  console.log('  POST /agora/token');
+  console.log('  POST /twilio/create-room');
+  console.log('  POST /twilio/recording-webhook');
+  console.log('  GET  /recordings/:id/signed-url');
+  console.log('  GET  /health');
 });
 
 module.exports = app;
