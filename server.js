@@ -42,10 +42,20 @@ const TOPUP_MAX = 1000;
 
 // Middleware
 // Configure CORS to handle preflight and allow required headers/methods
-const allowedOrigins = [
+// The production site, its www alias, and anything named in env. The real
+// domain is built in rather than left to FRONTEND_URL alone: when that env var
+// drifted away from the live domain, every browser call from yapski.com failed
+// preflight — Connect onboarding, withdrawals, subscriptions and stream tokens
+// alike — and the app could only report "Failed to fetch".
+const DEFAULT_ORIGINS = ['https://yapski.com', 'https://www.yapski.com'];
+
+const allowedOrigins = [...new Set([
+  ...DEFAULT_ORIGINS,
   process.env.FRONTEND_URL,
-  process.env.PREVIEW_ORIGIN
-].filter(Boolean);
+  process.env.PREVIEW_ORIGIN,
+  // Comma-separated, for any additional domain without a code change.
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim()),
+].filter(Boolean))];
 
 // Helper to allow Lovable preview domains (*.lovable.app, *.lovableproject.com)
 const isLovablePreview = (origin) => {
@@ -74,7 +84,11 @@ const corsOptions = {
     ) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // Refusing with an Error makes Express return 500 with no CORS headers,
+      // so a misconfigured origin looks like the server is down. Say no
+      // quietly instead, and leave a line in the logs naming the origin.
+      console.warn('CORS: blocked origin', origin);
+      callback(null, false);
     }
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -200,8 +214,11 @@ app.post('/stripe/create-express-account', verifyToken, async (req, res) => {
       onboardingUrl: accountLink.url
     });
   } catch (error) {
+    // Pass Stripe's own message through. The common failure here is the
+    // platform account not having Connect enabled in live mode, and a generic
+    // 'Failed to create account' gives nobody a way to find that out.
     console.error('Error creating Express account:', error);
-    res.status(500).json({ error: 'Failed to create account' });
+    res.status(500).json({ error: error?.message || 'Failed to create account' });
   }
 });
 
@@ -987,6 +1004,7 @@ app.get('/health', (req, res) => {
 
 app.listen(port, () => {
   console.log(`🚀 Talk Profit Link backend running on port ${port}`);
+  console.log('🌐 Allowed origins:', allowedOrigins.join(', ') || '(none)');
   console.log('📊 Endpoints:');
   console.log('  POST /stripe/create-payment-intent');
   console.log('  POST /stripe/confirm-topup');
