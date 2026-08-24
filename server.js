@@ -711,6 +711,7 @@ async function handleTwilioRecordingEvent(body) {
     const composition = await twilioClient.video.v1.compositions(compositionSid).fetch();
     const mediaUrl = `https://video.twilio.com${composition.url}/Media`;
 
+
     const mediaResp = await fetch(mediaUrl, {
       headers: {
         Authorization:
